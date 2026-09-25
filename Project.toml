@@ -1,0 +1,23 @@
+name = "WesterveltEDG"
+uuid = "71b6557a-c5d8-458b-9ec3-970ce83b3a0e"
+version = "0.1.0"
+authors = ["Yiwei Wang"]
+
+[deps]
+DelimitedFiles = "8bb1440f-4735-579b-a4ab-409b98df4dab"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
+
+[compat]
+DelimitedFiles = "1"
+LinearAlgebra = "1"
+Printf = "1"
+SpecialFunctions = "2"
+julia = "1.10"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
