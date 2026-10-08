@@ -100,7 +100,7 @@ for ri, (norm, ylab) in enumerate(ROWS):
             ax.set_xticklabels([r"$0.05$", r"$0.1$", r"$0.2$"])
             ax.xaxis.set_minor_formatter(NullFormatter())
             ax.set_xlabel(r"$h$")
-        ax.legend(fontsize=5.0, loc="lower right", ncol=3,
+        ax.legend(fontsize=6.0, loc="lower right", ncol=3,
                   handlelength=0.7, handletextpad=0.30, columnspacing=0.55,
                   borderpad=0.25, labelspacing=0.20, borderaxespad=0.3,
                   frameon=True, facecolor="white", edgecolor="0.6", framealpha=1.0)

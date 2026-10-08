@@ -9,7 +9,7 @@ module WesterveltEDG
 using LinearAlgebra
 using SpecialFunctions: gamma
 
-export solve, precompute, edg_rhs, rk4_step, difference_norms
+export solve, precompute, edg_rhs, edg_rhs!, rk4_step, rk4_step!, Workspace, difference_norms
 export flux_parameters, GaussianSource
 export Coefficients, paper_coefficients, replace_coefficients, constant_coefficients
 export JacobiP, GradJacobiP, GaussQCofs

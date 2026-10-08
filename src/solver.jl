@@ -122,8 +122,9 @@ function solve(q::Int, N::Int, T::Float64;
                                           receivers = receivers, snap_times = snap_times)
 
     t = 0.0
+    ws = Workspace(pre, N)
     for _ in 1:nsteps
-        u, v = rk4_step(u, v, t, dt, N, h, pre)
+        rk4_step!(u, v, t, dt, N, h, pre, ws)
         t += dt
     end
 
@@ -136,19 +137,33 @@ function solve(q::Int, N::Int, T::Float64;
 end
 
 """
-    rk4_step(u, v, t, dt, N, h, pre) -> (u, v)
+    rk4_step!(u, v, t, dt, N, h, pre, ws) -> (u, v)
 
-One step of the classical fourth-order Runge–Kutta method.
+One step of the classical fourth-order Runge–Kutta method, in place, with the
+workspace `ws = Workspace(pre, N)`.
 """
-function rk4_step(u, v, t, dt, N, h, pre)
-    k1u, k1v = edg_rhs(u,                  v,                  t,          N, h, pre)
-    k2u, k2v = edg_rhs(u .+ 0.5*dt .* k1u, v .+ 0.5*dt .* k1v, t + 0.5*dt, N, h, pre)
-    k3u, k3v = edg_rhs(u .+ 0.5*dt .* k2u, v .+ 0.5*dt .* k2v, t + 0.5*dt, N, h, pre)
-    k4u, k4v = edg_rhs(u .+     dt .* k3u, v .+     dt .* k3v, t +     dt, N, h, pre)
-    u = u .+ (dt/6.0) .* (k1u .+ 2.0 .* k2u .+ 2.0 .* k3u .+ k4u)
-    v = v .+ (dt/6.0) .* (k1v .+ 2.0 .* k2v .+ 2.0 .* k3v .+ k4v)
+function rk4_step!(u, v, t, dt, N, h, pre, ws)
+    su = ws.su;  sv = ws.sv
+    function stage!(ku, kv, tt)
+        a, b = edg_rhs!(ws, su, sv, tt, N, h, pre)
+        ku .= a;  kv .= b
+    end
+    su .= u;  sv .= v;                                         stage!(ws.k1u, ws.k1v, t)
+    su .= u .+ 0.5*dt .* ws.k1u;  sv .= v .+ 0.5*dt .* ws.k1v;  stage!(ws.k2u, ws.k2v, t + 0.5*dt)
+    su .= u .+ 0.5*dt .* ws.k2u;  sv .= v .+ 0.5*dt .* ws.k2v;  stage!(ws.k3u, ws.k3v, t + 0.5*dt)
+    su .= u .+     dt .* ws.k3u;  sv .= v .+     dt .* ws.k3v;  stage!(ws.k4u, ws.k4v, t +     dt)
+    u .= u .+ (dt/6.0) .* (ws.k1u .+ 2.0 .* ws.k2u .+ 2.0 .* ws.k3u .+ ws.k4u)
+    v .= v .+ (dt/6.0) .* (ws.k1v .+ 2.0 .* ws.k2v .+ 2.0 .* ws.k3v .+ ws.k4v)
     return u, v
 end
+
+"""
+    rk4_step(u, v, t, dt, N, h, pre) -> (u, v)
+
+One step of the classical fourth-order Runge–Kutta method (allocating
+version of [`rk4_step!`](@ref); `u`, `v` are not modified).
+"""
+rk4_step(u, v, t, dt, N, h, pre) = rk4_step!(copy(u), copy(v), t, dt, N, h, pre, Workspace(pre, N))
 
 """
     precompute(q_u, N; kwargs...) -> (pre, geo)
@@ -366,9 +381,45 @@ function precompute(q::Int, N::Int;
         src_on = src_on,  src_proj = src_proj,  src_time = src_time,
         mms_on = mode == :mms,
     )
+    pre = merge(pre, _rhs_data(pre, N))
     geo = (S_u = S_u, W2d = W2d, xloc = xloc_all, yloc = yloc_all,
            err_c2 = err_c2, err_beta = err_beta)
     return pre, geo
+end
+
+# Data of the batched RHS (src/rhs.jl), derived from the element-by-element
+# arrays above:
+# - face coefficients by face: horizontal faces (point, face row 1..N+1, column),
+#   vertical faces (point, row, face column 1..N+1);
+# - boundary data by point: (point, column) on y = 0, 1 and (point, row) on x = 0, 1;
+# - Π(X) = P_h_v' (W ∘ X) P_h_v for X = Φ, βΦ², ∇·(c²∇Φ), ∇·(α∇Φ) per element
+#   (element-last), so that the manufactured source is a combination of them;
+# - β at the high-order points (element-last) and P_h_v' for the mass solve.
+function _rhs_data(pre, N)
+    nq = pre.qu1;  nv = pre.qv1;  qh = pre.q_high
+    hface(bot, top) = (A = zeros(nq, N + 1, N);
+                       for k in 1:N, j in 1:N; A[:, j, k] = bot[j, k, :]; end;
+                       for k in 1:N; A[:, N + 1, k] = top[N, k, :]; end; A)
+    vface(lft, rgt) = (A = zeros(nq, N, N + 1);
+                       for k in 1:N, j in 1:N; A[:, j, k] = lft[j, k, :]; end;
+                       for j in 1:N; A[:, j, N + 1] = rgt[j, N, :]; end; A)
+    proj(X) = (Pi = zeros(nv, nv, N, N);
+               for k in 1:N, j in 1:N
+                   Pi[:, :, j, k] = pre.P_h_v' * (pre.W2d_h .* X[j, k, :, :]) * pre.P_h_v
+               end; Pi)
+    elast(X) = permutedims(X, (3, 4, 1, 2))
+    (hc2 = hface(pre.bot_c2, pre.top_c2), haf = hface(pre.bot_af, pre.top_af),
+     hcf = hface(pre.bot_cf, pre.top_cf), hbf = hface(pre.bot_bf, pre.top_bf),
+     vc2 = vface(pre.lft_c2, pre.rgt_c2), vaf = vface(pre.lft_af, pre.rgt_af),
+     vcf = vface(pre.lft_cf, pre.rgt_cf), vbf = vface(pre.lft_bf, pre.rgt_bf),
+     bcB_sp = permutedims(pre.bc_bot_sp), bcB_spy = permutedims(pre.bc_bot_spy),
+     bcT_sp = permutedims(pre.bc_top_sp), bcT_spy = permutedims(pre.bc_top_spy),
+     bcL_sp = permutedims(pre.bc_lft_sp), bcL_spx = permutedims(pre.bc_lft_spx),
+     bcR_sp = permutedims(pre.bc_rgt_sp), bcR_spx = permutedims(pre.bc_rgt_spx),
+     PiSP = proj(pre.mms_SP), PiBSP2 = proj(pre.mms_BF .* pre.mms_SP .^ 2),
+     PiCdiv = proj(pre.mms_Cdiv), PiDdiv = proj(pre.mms_Ddiv),
+     src_projE = elast(pre.src_proj), beta_hE = elast(pre.mms_BF),
+     P_h_vT = permutedims(pre.P_h_v), mass_tol = 1e-14)
 end
 
 # L² errors of u, v, ∇u and the energy error against u = cos(ωT) Φ at time T.
@@ -484,8 +535,9 @@ function _run_source(u, v, dt, nsteps, N, h, pre, geo;
     rt_t  = Float64[];  rt_v = Vector{Float64}[]
     snaps = Tuple{Float64, Matrix{Float64}}[]
     snap_left = sort(collect(snap_times))
+    ws = Workspace(pre, N)
     for it in 1:nsteps
-        u, v = rk4_step(u, v, t, dt, N, h, pre)
+        rk4_step!(u, v, t, dt, N, h, pre, ws)
         t += dt
         (all(isfinite, u) && all(isfinite, v)) || error("blow-up at t=$t")
         push!(rt_t, t);  push!(rt_v, recvf(v))

@@ -1,5 +1,8 @@
 using WesterveltEDG
-using Test
+using Test, Random
+
+# element-by-element RHS of v0.1.0 with the dense LU mass solve (reference)
+include("reference_rhs.jl")
 
 @testset "WesterveltEDG" begin
 
@@ -31,6 +34,24 @@ using Test
             r = max(r, maximum(abs.(vt0[j, k, :, :] .- proj)));  s = max(s, maximum(abs.(proj)))
         end
         @test r / s < 1e-12
+    end
+
+    # The batched RHS (src/rhs.jl) against the element-by-element reference
+    # implementation of v0.1.0: same scheme, different order of operations
+    # and an iterative (CG, tolerance 1e-14) instead of a direct mass solve.
+    @testset "batched RHS = reference RHS ($mode, $boundary)" for mode in (:mms, :initial_value, :source),
+                                                                  boundary in (:absorbing, :dirichlet)
+        Random.seed!(2)
+        worst = 0.0
+        for q in (1, 3, 4), N in (1, 2, 4), flux in (:upwind, :central, :alternating), mixed in (true, false)
+            pre, _ = precompute(q, N; flux = flux, mixed = mixed, mode = mode, boundary = boundary, sigma = 0.3)
+            u = randn(N, N, pre.qu1, pre.qu1);  v = randn(N, N, pre.qv1, pre.qv1)
+            a = edg_rhs_reference(u, v, 0.037, N, 1.0 / N, pre)
+            b = edg_rhs(u, v, 0.037, N, 1.0 / N, pre)
+            worst = max(worst, maximum(abs, a[1] .- b[1]) / maximum(abs, a[1]),
+                               maximum(abs, a[2] .- b[2]) / maximum(abs, a[2]))
+        end
+        @test worst < 1e-12
     end
 
     # Regression against the stored convergence data (data/convergence/results.csv).

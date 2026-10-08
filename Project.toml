@@ -1,6 +1,6 @@
 name = "WesterveltEDG"
 uuid = "71b6557a-c5d8-458b-9ec3-970ce83b3a0e"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Yiwei Wang"]
 
 [deps]
@@ -17,7 +17,8 @@ SpecialFunctions = "2"
 julia = "1.10"
 
 [extras]
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Test"]
+test = ["Random", "Test"]

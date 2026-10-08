@@ -4,20 +4,36 @@
 # on a uniform Cartesian mesh of the unit square with tensor-product Legendre
 # bases of degree q_u (for u) and q_v (for v).
 #
-# Layout: u[j, k, :, :] holds the (q_u+1)×(q_u+1) modal coefficients on the
-# element in row j (y-direction) and column k (x-direction); likewise v.
+# Layout of the state: u[j, k, :, :] holds the (q_u+1)×(q_u+1) modal
+# coefficients on the element in row j (y-direction) and column k
+# (x-direction); likewise v. On an element the coefficient matrix U[a, b] has
+# the y-mode a in the first and the x-mode b in the second index, so that the
+# values at the tensor Gauss points are P U P'.
 #
 # The displacement is advanced as ũ = u - u₀ with u₀ the initial profile
 # (see `solve`), which only adds the known terms ∇·(c²∇u₀) to the source and
 # -(c²∇u₀)·n to the boundary data.
 #
-# All coefficient and data arrays are read from the precomputed NamedTuple
-# `pre` built in solver.jl.
+# Structure of one evaluation (the element- and face-sized arrays are
+# preallocated in a `Workspace`; only small boundary arrays are allocated):
+#   1. copy u, v to element-last arrays U[:, :, j, k] (and their transposes);
+#   2. traces on the four sides of every element (values and normal
+#      derivatives at the face Gauss points) by a few large matrix products;
+#   3. numerical fluxes on all faces at once; every interior face is visited
+#      once and yields the contributions to both neighbouring elements;
+#   4. lift of the face contributions back to the elements;
+#   5. volume terms, manufactured source and the u-equation element by element;
+#   6. the mass system ∫(1 - 2βv_h) φ v̇_h = R on every element by matrix-free
+#      conjugate gradients (see `_mass_solve_cg!`).
+# The result is that of the element-by-element version of v0.1.0 (kept in
+# test/reference_rhs.jl, dense LU mass solve) up to the order of floating-point
+# operations and the CG tolerance pre.mass_tol = 1e-14 of the mass solve.
 
 # Pointwise absorbing-boundary flux on a physical boundary face.
-# Inputs are values at the face quadrature points; `*_ex` are the boundary
-# data. Returns (F1, dv): the normal-flux term entering the v-equation and
-# the v-trace correction v* - v_h (scaled by 1/(c √(1-βv_h))).
+# Inputs are values at the face quadrature points (arrays of any common
+# shape); `*_ex` are the boundary data. Returns (F1, dv): the total numerical
+# normal flux ((c²∇u)* + (α∇v)*)·n entering the v-equation and the v-trace
+# correction v* - v_h.
 @inline function _abc_face(pre, c2f, af, cf, bf, v_fp, grad_u_n, grad_v_n, gu_ex, gv_ex, v_ex)
     gamma_abc = pre.gamma_abc;  eta_abc = pre.eta_abc;  sigma = pre.sigma
 
@@ -34,303 +50,280 @@
 end
 
 """
-    edg_rhs(u, v, t, N, h, pre) -> (u_t, v_t)
+    Workspace(pre, N)
 
-Evaluate the semi-discrete EDG right-hand side at time `t`.
+Preallocated arrays for [`edg_rhs!`](@ref) and [`rk4_step!`](@ref) on an `N×N`
+mesh with the precomputed data `pre`.
 """
-function edg_rhs(u::Array{Float64,4}, v::Array{Float64,4},
-                 t::Float64, N::Int, h::Float64, pre::NamedTuple)
+function Workspace(pre, N)
+    nu = pre.qu1;  nv = pre.qv1;  nq = pre.qu1;  qh = pre.q_high
+    z3(n) = zeros(n, N, N)
+    (U = zeros(nu, nu, N, N), Ut = zeros(nu, nu, N, N),
+     V = zeros(nv, nv, N, N), Vt = zeros(nv, nv, N, N),
+     tu = zeros(1, nu * N * N), tv = zeros(1, nv * N * N),
+     # element traces at the face Gauss points: u-normal derivatives (reference
+     # scaling), v values and v-normal derivatives, on the sides B, T, L, R
+     duB = z3(nq), duT = z3(nq), duL = z3(nq), duR = z3(nq),
+     vB  = z3(nq), vT  = z3(nq), vL  = z3(nq), vR  = z3(nq),
+     dvB = z3(nq), dvT = z3(nq), dvL = z3(nq), dvR = z3(nq),
+     # per element and side: A (lifted with the trace of φ_v, scale 2/h),
+     # D (lifted with the normal derivative of φ_v, scale 4/h²) and
+     # Fu (lifted with the normal derivative of φ_u, u-equation)
+     AB = z3(nq), AT = z3(nq), AL = z3(nq), AR = z3(nq),
+     DB = z3(nq), DT = z3(nq), DL = z3(nq), DR = z3(nq),
+     FB = z3(nq), FT = z3(nq), FL = z3(nq), FR = z3(nq),
+     Xw = zeros(nq, N * N), Yv = zeros(nv, N * N), Yu = zeros(nu, N * N),
+     Rv = zeros(nv, nv, N, N), Fu = zeros(nu, nu, N, N),
+     UT = zeros(nu, nu, N, N), VT = zeros(nv, nv, N, N),
+     bu = zeros(nu * nu), bv = zeros(nv * nv),
+     # conjugate-gradient work arrays (one element at a time)
+     cg_T1 = zeros(qh, nv), cg_T2 = zeros(nv, qh), cg_Y = zeros(qh, qh), cg_G = zeros(qh, qh),
+     cg_r = zeros(nv, nv), cg_p = zeros(nv, nv), cg_Ap = zeros(nv, nv),
+     # outputs in the state layout and RK4 stages
+     ut = zeros(N, N, nu, nu), vt = zeros(N, N, nv, nv),
+     k1u = zeros(N, N, nu, nu), k2u = zeros(N, N, nu, nu), k3u = zeros(N, N, nu, nu), k4u = zeros(N, N, nu, nu),
+     k1v = zeros(N, N, nv, nv), k2v = zeros(N, N, nv, nv), k3v = zeros(N, N, nv, nv), k4v = zeros(N, N, nv, nv),
+     su = zeros(N, N, nu, nu), sv = zeros(N, N, nv, nv))
+end
 
-    qu1 = pre.qu1;  qv1 = pre.qv1;  omega = pre.omega
-    w   = pre.w
+# out[i, j, k] = Σ_b P[i, b] Σ_a E[a] A[a, b, j, k]: trace on the side selected by
+# the row vector E, evaluated at the face Gauss points.
+function _trace!(out, P, E, A, tmp)
+    n = size(A, 1)
+    mul!(tmp, E, reshape(A, n, :))
+    mul!(reshape(out, size(out, 1), :), P, reshape(tmp, n, :))
+    return out
+end
+
+# R[a, b, j, k] += c E[a] Y[b, j, k]   (horizontal sides)  or
+# R[a, b, j, k] += c Y[a, j, k] E[b]   (vertical sides),   with Y = P' (w ∘ Z).
+function _lift!(R, P, w, Z, E, c, horizontal::Bool, Xw, Y)
+    nq = size(Z, 1);  n = size(P, 2);  N = size(R, 3)
+    Xw .= w .* reshape(Z, nq, :)
+    mul!(Y, transpose(P), Xw)
+    Y4 = reshape(Y, n, N, N)
+    Ev = vec(E)
+    if horizontal
+        R .+= c .* reshape(Ev, n, 1, 1, 1) .* reshape(Y4, 1, n, N, N)
+    else
+        R .+= c .* reshape(Y4, n, 1, N, N) .* reshape(Ev, 1, n, 1, 1)
+    end
+    return R
+end
+
+"""
+    edg_rhs!(ws, u, v, t, N, h, pre) -> (ws.ut, ws.vt)
+
+Evaluate the semi-discrete EDG right-hand side at time `t` into the workspace
+`ws` (see [`Workspace`](@ref)). The returned arrays are overwritten by the next
+call.
+"""
+function edg_rhs!(ws, u::Array{Float64,4}, v::Array{Float64,4},
+                  t::Float64, N::Int, h::Float64, pre::NamedTuple)
+    nu = pre.qu1;  nv = pre.qv1;  omega = pre.omega;  w = pre.w
     P_u = pre.P_u;  P_v = pre.P_v
-    Ebl_u = pre.Ebl_u;  Ebr_u = pre.Ebr_u
-    E1bl_u = pre.E1bl_u; E1br_u = pre.E1br_u
-    Ebl_v = pre.Ebl_v;  Ebr_v = pre.Ebr_v
-    E1bl_v = pre.E1bl_v; E1br_v = pre.E1br_v
-    W2d_h = pre.W2d_h
-    P_h_v = pre.P_h_v;  Phi2d_h_v = pre.Phi2d_h_v
-
-    # interelement flux parameters (θ, τ, λ_u, λ_v)
-    theta    = pre.theta
-    tau      = pre.tau
-    lambda_u = pre.lambda_u
-    lambda_v = pre.lambda_v
-
-    two_h   = 2.0 / h
-    four_hh = 4.0 / (h * h)
-
+    theta = pre.theta;  tau = pre.tau;  lu = pre.lambda_u;  lv = pre.lambda_v
+    two_h = 2.0 / h;  four_hh = 4.0 / (h * h)
     # time factors of the manufactured solution u = cos(ωt) Φ(x); both are
     # switched off outside the manufactured-solution mode, which leaves only
     # the u₀ terms of the ũ = u - u₀ change of variables.
     ct = pre.mms_on ? cos(omega * t) : 0.0
     st = pre.mms_on ? sin(omega * t) : 0.0
 
-    ut = zeros(size(u))
-    vt = zeros(size(v))
-    vt_rhs_all = zeros(N, N, qv1, qv1)   # v-residual before the nonlinear mass solve
+    # ---- 1. element-last copies (and per-element transposes) ----
+    U = ws.U;  V = ws.V;  Ut = ws.Ut;  Vt = ws.Vt
+    permutedims!(U, u, (3, 4, 1, 2));  permutedims!(Ut, u, (4, 3, 1, 2))
+    permutedims!(V, v, (3, 4, 1, 2));  permutedims!(Vt, v, (4, 3, 1, 2))
 
-    for j in 1:N
-        for k in 1:N
+    # ---- 2. traces: bottom/top contract the y-mode, left/right the x-mode ----
+    _trace!(ws.duB, P_u, pre.E1bl_u, U, ws.tu);   _trace!(ws.duT, P_u, pre.E1br_u, U, ws.tu)
+    _trace!(ws.duL, P_u, pre.E1bl_u, Ut, ws.tu);  _trace!(ws.duR, P_u, pre.E1br_u, Ut, ws.tu)
+    _trace!(ws.vB,  P_v, pre.Ebl_v,  V, ws.tv);   _trace!(ws.vT,  P_v, pre.Ebr_v,  V, ws.tv)
+    _trace!(ws.vL,  P_v, pre.Ebl_v,  Vt, ws.tv);  _trace!(ws.vR,  P_v, pre.Ebr_v,  Vt, ws.tv)
+    _trace!(ws.dvB, P_v, pre.E1bl_v, V, ws.tv);   _trace!(ws.dvT, P_v, pre.E1br_v, V, ws.tv)
+    _trace!(ws.dvL, P_v, pre.E1bl_v, Vt, ws.tv);  _trace!(ws.dvR, P_v, pre.E1br_v, Vt, ws.tv)
 
-            uloc = u[j, k, :, :]
-            vloc = v[j, k, :, :]
+    # ---- 3. face fluxes ----
+    # interior faces: s = v^- - v^+ is the jump seen from the element on the
+    # "+" side (above, resp. to the right); g* = θ ∂_n w^+ + (1-θ) ∂_n w^-
+    # (reference scaling), jg = (2/h)(∂ w^- - ∂ w^+).
+    _interior_faces!(ws.AB, ws.DB, ws.FB, ws.AT, ws.DT, ws.FT,
+                     ws.vT, ws.vB, ws.duT, ws.duB, ws.dvT, ws.dvB,
+                     pre.hc2, pre.haf, theta, tau, lu, lv, two_h, N, Val(:horizontal))
+    _interior_faces!(ws.AL, ws.DL, ws.FL, ws.AR, ws.DR, ws.FR,
+                     ws.vR, ws.vL, ws.duR, ws.duL, ws.dvR, ws.dvL,
+                     pre.vc2, pre.vaf, theta, tau, lu, lv, two_h, N, Val(:vertical))
+    _boundary_faces!(ws, pre, ct, st, omega, two_h, N)
 
-            # ---- volume stiffness ----
-            vt_rhs = -four_hh * reshape(
-                         pre.Mc2_uv[j,k] * vec(uloc) + pre.Ma_vv[j,k] * vec(vloc),
-                         qv1, qv1)
+    # ---- 4./5. element residuals: volume, source, lifted face terms ----
+    Rv = ws.Rv;  Fu = ws.Fu;  bv = ws.bv
+    @inbounds for k in 1:N, j in 1:N
+        Ue = vec(view(U, :, :, j, k));  Ve = vec(view(V, :, :, j, k))
+        mul!(bv, pre.Mc2_uv[j, k], Ue)
+        mul!(bv, pre.Ma_vv[j, k], Ve, 1.0, 1.0)
+        view(Rv, :, :, j, k) .= reshape(bv, nv, nv) .* (-four_hh)
+    end
+    # manufactured source: the projection of
+    #   (1 - 2βv_ex) ∂_t v_ex - ∇·(c²∇u_ex) - ∇·(α∇v_ex) + ∇·(c²∇u₀),
+    # u_ex = cos(ωt)Φ, as a combination of time-independent projections
+    Rv .+= (-omega^2 * ct) .* pre.PiSP .+ (-2.0 * omega^3 * st * ct) .* pre.PiBSP2 .+
+           (1.0 - ct) .* pre.PiCdiv .+ (omega * st) .* pre.PiDdiv
+    if pre.src_on
+        Rv .+= pre.src_time(t) .* pre.src_projE
+    end
+    fill!(Fu, 0.0)
+    for (A, D, F, Ev, E1v, E1u, hz) in ((ws.AB, ws.DB, ws.FB, pre.Ebl_v, pre.E1bl_v, pre.E1bl_u, true),
+                                        (ws.AT, ws.DT, ws.FT, pre.Ebr_v, pre.E1br_v, pre.E1br_u, true),
+                                        (ws.AL, ws.DL, ws.FL, pre.Ebl_v, pre.E1bl_v, pre.E1bl_u, false),
+                                        (ws.AR, ws.DR, ws.FR, pre.Ebr_v, pre.E1br_v, pre.E1br_u, false))
+        _lift!(Rv, P_v, w, A, Ev,  two_h,   hz, ws.Xw, ws.Yv)
+        _lift!(Rv, P_v, w, D, E1v, four_hh, hz, ws.Xw, ws.Yv)
+        _lift!(Fu, P_u, w, F, E1u, 1.0,     hz, ws.Xw, ws.Yu)
+    end
 
-            # ---- manufactured source (+ ∇·(c²∇u₀) from the ũ shift) ----
-            SP   = pre.mms_SP[j, k, :, :]
-            Cdiv = pre.mms_Cdiv[j, k, :, :]
-            Ddiv = pre.mms_Ddiv[j, k, :, :]
-            BF   = pre.mms_BF[j, k, :, :]
+    # u-equation: (c²∇φ_u, ∇u̇_h) + mean condition, pinned c²-stiffness (Cholesky)
+    bu = ws.bu;  UT = ws.UT
+    @inbounds for k in 1:N, j in 1:N
+        Ve = vec(view(V, :, :, j, k))
+        mul!(bu, transpose(pre.Mc2_uv[j, k]), Ve)
+        bu .-= vec(view(Fu, :, :, j, k))
+        bu[1] += V[1, 1, j, k]
+        R = pre.R_ut[j, k]
+        ldiv!(transpose(R), bu);  ldiv!(R, bu)
+        vec(view(UT, :, :, j, k)) .= bu
+    end
 
-            v_h_mms  = -omega * st * SP
-            vt_h_mms = -omega^2 * ct * SP
-            fv_h     = (1.0 .- 2.0 .* BF .* v_h_mms) .* vt_h_mms .-
-                       ct .* Cdiv .+ omega * st .* Ddiv .+ Cdiv
+    # ---- 6. mass system ----
+    _mass_solve_cg!(ws.VT, V, Rv, pre, ws, N)
 
-            vt_rhs = vt_rhs .+ P_h_v' * (W2d_h .* fv_h) * P_h_v
+    permutedims!(ws.ut, UT, (3, 4, 1, 2))
+    permutedims!(ws.vt, ws.VT, (3, 4, 1, 2))
+    return ws.ut, ws.vt
+end
 
-            # ---- localized source (source mode) ----
-            if pre.src_on
-                vt_rhs = vt_rhs .+ pre.src_time(t) .* pre.src_proj[j, k, :, :]
-            end
+"""
+    edg_rhs(u, v, t, N, h, pre) -> (u_t, v_t)
 
-            f = zeros(qu1, qu1)
+Evaluate the semi-discrete EDG right-hand side at time `t` (allocating
+version of [`edg_rhs!`](@ref)).
+"""
+function edg_rhs(u::Array{Float64,4}, v::Array{Float64,4},
+                 t::Float64, N::Int, h::Float64, pre::NamedTuple)
+    ws = Workspace(pre, N)
+    edg_rhs!(ws, u, v, t, N, h, pre)
+    return copy(ws.ut), copy(ws.vt)
+end
 
-            # ==================================================================
-            #  BOTTOM FACE  (n = (0,-1))
-            # ==================================================================
-            if j == 1
-                c2f = pre.bot_c2[j, k, :]
-                af  = pre.bot_af[j, k, :]
-                cf  = pre.bot_cf[j, k, :]
-                bf  = pre.bot_bf[j, k, :]
+# Interior faces between the elements on the "-" side (below / to the left)
+# and the "+" side (above / to the right). For horizontal faces the face
+# index runs over (point, row of the "+" element, column); for vertical faces
+# over (point, row, column of the "+" element). Writes the A, D, F arrays of
+# the "+" element's B/L side and of the "-" element's T/R side.
+function _interior_faces!(Ap, Dp, Fp, Am, Dm, Fm, vM, vP, duM, duP, dvM, dvP,
+                          c2f, aff, theta, tau, lu, lv, two_h, N, ::Val{orient}) where {orient}
+    N < 2 && return nothing
+    if orient === :horizontal
+        P = (:, 2:N, :);  M = (:, 1:N-1, :);  Fc = (:, 2:N, :)
+    else
+        P = (:, :, 2:N);  M = (:, :, 1:N-1);  Fc = (:, :, 2:N)
+    end
+    @views begin
+        vm = vM[M...];   vp = vP[P...]
+        dum = duM[M...]; dup = duP[P...]
+        dvm = dvM[M...]; dvp = dvP[P...]
+        c2 = c2f[Fc...]; af = aff[Fc...]
+        # "+" element (bottom / left side of its own)
+        @. Ap[P...] = (c2 * lu + af * lv) * (vm - vp) -
+                      two_h * (c2 * (theta * dup + (1 - theta) * dum) + af * (theta * dvp + (1 - theta) * dvm))
+        @. Dp[P...] = -af * (theta * (vm - vp) - tau * (c2 * (two_h * (dum - dup)) + af * (two_h * (dvm - dvp))))
+        @. Fp[P...] =  c2 * (theta * (vm - vp) - tau * (c2 * (two_h * (dum - dup)) + af * (two_h * (dvm - dvp))))
+        # "-" element (top / right side of its own); its jump is -(vm - vp)
+        @. Am[M...] = two_h * (c2 * (theta * dup + (1 - theta) * dum) + af * (theta * dvp + (1 - theta) * dvm)) -
+                      (c2 * lu + af * lv) * (vm - vp)
+        @. Dm[M...] =  af * ((1 - theta) * (vp - vm) - tau * (c2 * (two_h * (dum - dup)) + af * (two_h * (dvm - dvp))))
+        @. Fm[M...] = -c2 * ((1 - theta) * (vp - vm) - tau * (c2 * (two_h * (dum - dup)) + af * (two_h * (dvm - dvp))))
+    end
+    return nothing
+end
 
-                v_fp  = P_v * (Ebl_v * vloc)'
-                uy_fp = P_u * (two_h * (E1bl_u * uloc))'
-                vy_fp = P_v * (two_h * (E1bl_v * vloc))'
-                grad_u_n = -uy_fp
-                grad_v_n = -vy_fp
-
-                sp_bc  = pre.bc_bot_sp[k, :]
-                spy_bc = pre.bc_bot_spy[k, :]
-                gu_ex =  -ct .* spy_bc .+ spy_bc        # minus ∇u₀·n = -spy_bc
-                gv_ex =   omega * st .* spy_bc
-                v_ex  =  -omega * st .* sp_bc
-
-                F1, dv_pts = _abc_face(pre, c2f, af, cf, bf, v_fp, grad_u_n, grad_v_n, gu_ex, gv_ex, v_ex)
-
-                vt_rhs = vt_rhs .+
-                         two_h  .* Ebl_v'  * (P_v' * (w .* F1))' .-
-                         four_hh .* E1bl_v' * (P_v' * (w .* (af .* dv_pts)))'
-                f = f .+ E1bl_u' * (P_u' * (w .* (c2f .* dv_pts)))'
-
-            else
-                uout = u[j-1, k, :, :]
-                vout = v[j-1, k, :, :]
-                c2f = pre.bot_c2[j, k, :]
-                af  = pre.bot_af[j, k, :]
-
-                v_jump_p = P_v * (Ebr_v * vout .- Ebl_v * vloc)'
-                jgu_p    = P_u * (two_h .* (E1br_u * uout .- E1bl_u * uloc))'
-                jgv_p    = P_v * (two_h .* (E1br_v * vout .- E1bl_v * vloc))'
-                gu_star_p = P_u * (theta .* E1bl_u * uloc .+ (1-theta) .* E1br_u * uout)'
-                gv_star_p = P_v * (theta .* E1bl_v * vloc .+ (1-theta) .* E1br_v * vout)'
-
-                dv_p   = theta .* v_jump_p .- tau .* (c2f .* jgu_p .+ af .* jgv_p)
-                flux_p = c2f .* gu_star_p .+ af .* gv_star_p
-                pen_p  = (c2f .* lambda_u .+ af .* lambda_v) .* v_jump_p
-
-                f = f .+ E1bl_u' * (P_u' * (w .* (c2f .* dv_p)))'
-                vt_rhs = vt_rhs .-
-                         four_hh .* Ebl_v'  * (P_v' * (w .* flux_p))' .-
-                         four_hh .* E1bl_v' * (P_v' * (w .* (af .* dv_p)))' .+
-                         two_h   .* Ebl_v'  * (P_v' * (w .* pen_p))'
-            end
-
-            # ==================================================================
-            #  TOP FACE  (n = (0,+1))
-            # ==================================================================
-            if j == N
-                c2f = pre.top_c2[j, k, :]
-                af  = pre.top_af[j, k, :]
-                cf  = pre.top_cf[j, k, :]
-                bf  = pre.top_bf[j, k, :]
-
-                v_fp  = P_v * (Ebr_v * vloc)'
-                uy_fp = P_u * (two_h * (E1br_u * uloc))'
-                vy_fp = P_v * (two_h * (E1br_v * vloc))'
-                grad_u_n = uy_fp
-                grad_v_n = vy_fp
-
-                sp_bc  = pre.bc_top_sp[k, :]
-                spy_bc = pre.bc_top_spy[k, :]
-                gu_ex =  ct .* spy_bc .- spy_bc         # minus ∇u₀·n = +spy_bc
-                gv_ex = -omega * st .* spy_bc
-                v_ex  = -omega * st .* sp_bc
-
-                F1, dv_pts = _abc_face(pre, c2f, af, cf, bf, v_fp, grad_u_n, grad_v_n, gu_ex, gv_ex, v_ex)
-
-                vt_rhs = vt_rhs .+
-                         two_h   .* Ebr_v'  * (P_v' * (w .* F1))' .+
-                         four_hh .* E1br_v' * (P_v' * (w .* (af .* dv_pts)))'
-                f = f .- E1br_u' * (P_u' * (w .* (c2f .* dv_pts)))'
-
-            else
-                uout = u[j+1, k, :, :]
-                vout = v[j+1, k, :, :]
-                c2f = pre.top_c2[j, k, :]
-                af  = pre.top_af[j, k, :]
-
-                v_jump_p = P_v * (Ebl_v * vout .- Ebr_v * vloc)'
-                jgu_p    = P_u * (two_h .* (.-E1bl_u * uout .+ E1br_u * uloc))'
-                jgv_p    = P_v * (two_h .* (.-E1bl_v * vout .+ E1br_v * vloc))'
-                gu_star_p = P_u * ((1-theta) .* E1br_u * uloc .+ theta .* E1bl_u * uout)'
-                gv_star_p = P_v * ((1-theta) .* E1br_v * vloc .+ theta .* E1bl_v * vout)'
-
-                dv_p   = (1-theta) .* v_jump_p .- tau .* (c2f .* jgu_p .+ af .* jgv_p)
-                flux_p = c2f .* gu_star_p .+ af .* gv_star_p
-                pen_p  = (c2f .* lambda_u .+ af .* lambda_v) .* v_jump_p
-
-                f = f .- E1br_u' * (P_u' * (w .* (c2f .* dv_p)))'
-                vt_rhs = vt_rhs .+
-                         four_hh .* Ebr_v'  * (P_v' * (w .* flux_p))' .+
-                         four_hh .* E1br_v' * (P_v' * (w .* (af .* dv_p)))' .+
-                         two_h   .* Ebr_v'  * (P_v' * (w .* pen_p))'
-            end
-
-            # ==================================================================
-            #  LEFT FACE  (n = (-1,0)); the y-face pattern applied to transposes
-            # ==================================================================
-            if k == 1
-                c2f = pre.lft_c2[j, k, :]
-                af  = pre.lft_af[j, k, :]
-                cf  = pre.lft_cf[j, k, :]
-                bf  = pre.lft_bf[j, k, :]
-
-                uloc_T = uloc';  vloc_T = vloc'
-                v_fp  = P_v * (Ebl_v * vloc_T)'
-                ux_fp = P_u * (two_h * (E1bl_u * uloc_T))'
-                vx_fp = P_v * (two_h * (E1bl_v * vloc_T))'
-                grad_u_n = -ux_fp
-                grad_v_n = -vx_fp
-
-                sp_bc  = pre.bc_lft_sp[j, :]
-                spx_bc = pre.bc_lft_spx[j, :]
-                gu_ex =  -ct .* spx_bc .+ spx_bc        # minus ∇u₀·n = -spx_bc
-                gv_ex =   omega * st .* spx_bc
-                v_ex  =  -omega * st .* sp_bc
-
-                F1, dv_pts = _abc_face(pre, c2f, af, cf, bf, v_fp, grad_u_n, grad_v_n, gu_ex, gv_ex, v_ex)
-
-                vt_abc = two_h   .* Ebl_v'  * (P_v' * (w .* F1))' .-
-                         four_hh .* E1bl_v' * (P_v' * (w .* (af .* dv_pts)))'
-                f_abc  = E1bl_u' * (P_u' * (w .* (c2f .* dv_pts)))'
-
-                vt_rhs = vt_rhs .+ vt_abc'
-                f      = f      .+ f_abc'
-
-            else
-                uout = u[j, k-1, :, :]'
-                vout = v[j, k-1, :, :]'
-                c2f = pre.lft_c2[j, k, :]
-                af  = pre.lft_af[j, k, :]
-
-                v_jump_p = P_v * (Ebr_v * vout .- Ebl_v * vloc')'
-                jgu_p    = P_u * (two_h .* (E1br_u * uout .- E1bl_u * uloc'))'
-                jgv_p    = P_v * (two_h .* (E1br_v * vout .- E1bl_v * vloc'))'
-                gu_star_p = P_u * (theta .* E1bl_u * uloc' .+ (1-theta) .* E1br_u * uout)'
-                gv_star_p = P_v * (theta .* E1bl_v * vloc' .+ (1-theta) .* E1br_v * vout)'
-
-                dv_p   = theta .* v_jump_p .- tau .* (c2f .* jgu_p .+ af .* jgv_p)
-                flux_p = c2f .* gu_star_p .+ af .* gv_star_p
-                pen_p  = (c2f .* lambda_u .+ af .* lambda_v) .* v_jump_p
-
-                f      = f      .+ (P_u' * (w .* (c2f .* dv_p))) * E1bl_u
-                vt_rhs = vt_rhs .-
-                         four_hh .* (P_v' * (w .* flux_p)) * Ebl_v .-
-                         four_hh .* (P_v' * (w .* (af .* dv_p))) * E1bl_v .+
-                         two_h   .* (P_v' * (w .* pen_p)) * Ebl_v
-            end
-
-            # ==================================================================
-            #  RIGHT FACE  (n = (+1,0)); the y-face pattern applied to transposes
-            # ==================================================================
-            if k == N
-                c2f = pre.rgt_c2[j, k, :]
-                af  = pre.rgt_af[j, k, :]
-                cf  = pre.rgt_cf[j, k, :]
-                bf  = pre.rgt_bf[j, k, :]
-
-                uloc_T = uloc';  vloc_T = vloc'
-                v_fp  = P_v * (Ebr_v * vloc_T)'
-                ux_fp = P_u * (two_h * (E1br_u * uloc_T))'
-                vx_fp = P_v * (two_h * (E1br_v * vloc_T))'
-                grad_u_n = ux_fp
-                grad_v_n = vx_fp
-
-                sp_bc  = pre.bc_rgt_sp[j, :]
-                spx_bc = pre.bc_rgt_spx[j, :]
-                gu_ex =  ct .* spx_bc .- spx_bc         # minus ∇u₀·n = +spx_bc
-                gv_ex = -omega * st .* spx_bc
-                v_ex  = -omega * st .* sp_bc
-
-                F1, dv_pts = _abc_face(pre, c2f, af, cf, bf, v_fp, grad_u_n, grad_v_n, gu_ex, gv_ex, v_ex)
-
-                vt_abc = two_h   .* Ebr_v'  * (P_v' * (w .* F1))' .+
-                         four_hh .* E1br_v' * (P_v' * (w .* (af .* dv_pts)))'
-                f_abc  = .-E1br_u' * (P_u' * (w .* (c2f .* dv_pts)))'
-
-                vt_rhs = vt_rhs .+ vt_abc'
-                f      = f      .+ f_abc'
-
-            else
-                uout = u[j, k+1, :, :]'
-                vout = v[j, k+1, :, :]'
-                c2f = pre.rgt_c2[j, k, :]
-                af  = pre.rgt_af[j, k, :]
-
-                v_jump_p = P_v * (Ebl_v * vout .- Ebr_v * vloc')'
-                jgu_p    = P_u * (two_h .* (.-E1bl_u * uout .+ E1br_u * uloc'))'
-                jgv_p    = P_v * (two_h .* (.-E1bl_v * vout .+ E1br_v * vloc'))'
-                gu_star_p = P_u * ((1-theta) .* E1br_u * uloc' .+ theta .* E1bl_u * uout)'
-                gv_star_p = P_v * ((1-theta) .* E1br_v * vloc' .+ theta .* E1bl_v * vout)'
-
-                dv_p   = (1-theta) .* v_jump_p .- tau .* (c2f .* jgu_p .+ af .* jgv_p)
-                flux_p = c2f .* gu_star_p .+ af .* gv_star_p
-                pen_p  = (c2f .* lambda_u .+ af .* lambda_v) .* v_jump_p
-
-                f      = f      .- (P_u' * (w .* (c2f .* dv_p))) * E1br_u
-                vt_rhs = vt_rhs .+
-                         four_hh .* (P_v' * (w .* flux_p)) * Ebr_v .+
-                         four_hh .* (P_v' * (w .* (af .* dv_p))) * E1br_v .+
-                         two_h   .* (P_v' * (w .* pen_p)) * Ebr_v
-            end
-
-            vt_rhs_all[j, k, :, :] = vt_rhs
-
-            # ---- displacement equation (u-space, pinned c²-stiffness, Cholesky) ----
-            rhs_ut      = pre.Mc2_uv[j,k]' * vec(vloc) .- vec(f)
-            rhs_ut[1]  += vloc[1, 1]
-            R            = pre.R_ut[j, k]
-            ut[j, k, :, :] = reshape(R \ (R' \ rhs_ut), qu1, qu1)
-
+# Physical boundary faces (absorbing condition with exact data in the
+# manufactured-solution mode, homogeneous otherwise).
+function _boundary_faces!(ws, pre, ct, st, omega, two_h, N)
+    @views begin
+        # bottom (y = 0, n = (0,-1)) and top (y = 1, n = (0,+1)): rows 1 and N, along x
+        for (row, frow, sgn, sp, spn, A, D, F, vtr, dutr, dvtr) in
+                ((1, 1,     -1.0, pre.bcB_sp, pre.bcB_spy, ws.AB, ws.DB, ws.FB, ws.vB, ws.duB, ws.dvB),
+                 (N, N + 1,  1.0, pre.bcT_sp, pre.bcT_spy, ws.AT, ws.DT, ws.FT, ws.vT, ws.duT, ws.dvT))
+            c2f = pre.hc2[:, frow, :];  af = pre.haf[:, frow, :]
+            cf  = pre.hcf[:, frow, :];  bf = pre.hbf[:, frow, :]
+            grad_u_n = sgn .* (two_h .* dutr[:, row, :])
+            grad_v_n = sgn .* (two_h .* dvtr[:, row, :])
+            gu_ex = sgn .* (ct .* spn .- spn)              # ∇(u - u₀)·n of the exact solution
+            gv_ex = sgn .* (-omega * st .* spn)
+            v_ex  = -omega * st .* sp
+            F1, dv = _abc_face(pre, c2f, af, cf, bf, vtr[:, row, :], grad_u_n, grad_v_n, gu_ex, gv_ex, v_ex)
+            A[:, row, :] .= F1
+            D[:, row, :] .= sgn .* (af .* dv)
+            F[:, row, :] .= -sgn .* (c2f .* dv)
+        end
+        # left (x = 0, n = (-1,0)) and right (x = 1, n = (+1,0)): columns 1 and N, along y
+        for (col, fcol, sgn, sp, spn, A, D, F, vtr, dutr, dvtr) in
+                ((1, 1,     -1.0, pre.bcL_sp, pre.bcL_spx, ws.AL, ws.DL, ws.FL, ws.vL, ws.duL, ws.dvL),
+                 (N, N + 1,  1.0, pre.bcR_sp, pre.bcR_spx, ws.AR, ws.DR, ws.FR, ws.vR, ws.duR, ws.dvR))
+            c2f = pre.vc2[:, :, fcol];  af = pre.vaf[:, :, fcol]
+            cf  = pre.vcf[:, :, fcol];  bf = pre.vbf[:, :, fcol]
+            grad_u_n = sgn .* (two_h .* dutr[:, :, col])
+            grad_v_n = sgn .* (two_h .* dvtr[:, :, col])
+            gu_ex = sgn .* (ct .* spn .- spn)
+            gv_ex = sgn .* (-omega * st .* spn)
+            v_ex  = -omega * st .* sp
+            F1, dv = _abc_face(pre, c2f, af, cf, bf, vtr[:, :, col], grad_u_n, grad_v_n, gu_ex, gv_ex, v_ex)
+            A[:, :, col] .= F1
+            D[:, :, col] .= sgn .* (af .* dv)
+            F[:, :, col] .= -sgn .* (c2f .* dv)
         end
     end
+    return nothing
+end
 
-    # ---- nonlinear mass (1 - 2βv_h) solve per element (v-space) ----
-    for j in 1:N, k in 1:N
-        vloc = v[j, k, :, :]
-        BF   = pre.mms_BF[j, k, :, :]
-        v_quad_h = P_h_v * vloc * P_h_v'
-        wv       = vec((1.0 .- 2.0 .* BF .* v_quad_h) .* W2d_h)
-        Mw_h     = Phi2d_h_v' * (wv .* Phi2d_h_v)
-        vt[j, k, :, :] = reshape(Mw_h \ vec(vt_rhs_all[j, k, :, :]), qv1, qv1)
+# Mass system of the v-equation on every element,
+#     M(v_h) X = R,   M(v_h) = Φ' diag((1 - 2β v_q) W) Φ,   Φ = P ⊗ P,
+# with P the 1D Legendre basis at the q_high Gauss points, W the tensor
+# weights and v_q = v_h at those points. The basis is orthonormal and the rule
+# integrates the products exactly, so Φ' diag(W) Φ = I and
+#     M(v_h) = I - K(v_h),   K X = P' (G ∘ (P X P')) P,   G = 2β v_q W.
+# Since W^{1/2}Φ has orthonormal columns, the eigenvalues of M lie in
+# [min_q (1 - 2β v_q), max_q (1 - 2β v_q)]: M is symmetric positive definite
+# whenever 1 - 2β v_q > 0 at all points, with condition number at most
+# max(1 - 2βv_q)/min(1 - 2βv_q). The system is solved by
+# conjugate gradients, matrix-free and started from X = R (the exact solution
+# for K = 0); relative residual tolerance pre.mass_tol.
+function _mass_solve_cg!(X, V, Rv, pre, ws, N)
+    P = pre.P_h_v;  Pt = pre.P_h_vT;  W = pre.W2d_h;  tol = pre.mass_tol
+    nv = pre.qv1;  maxit = nv * nv + 10
+    T1 = ws.cg_T1;  T2 = ws.cg_T2;  Y = ws.cg_Y;  G = ws.cg_G
+    r = ws.cg_r;  p = ws.cg_p;  Ap = ws.cg_Ap
+    applyK!(out, Z) = (mul!(T1, P, Z); mul!(Y, T1, Pt); Y .*= G; mul!(T2, Pt, Y); mul!(out, T2, P); out)
+    nfail = 0
+    @inbounds for k in 1:N, j in 1:N
+        Ve = view(V, :, :, j, k);  Re = view(Rv, :, :, j, k);  Xe = view(X, :, :, j, k)
+        mul!(T1, P, Ve);  mul!(Y, T1, Pt)                       # v_q
+        G .= 2.0 .* view(pre.beta_hE, :, :, j, k) .* Y .* W
+        Xe .= Re
+        applyK!(r, Xe)                                          # r = R - M X = K R
+        p .= r
+        rr = dot(r, r);  r0 = sqrt(dot(Re, Re));  it = 0
+        while sqrt(rr) > tol * r0 && it < maxit
+            it += 1
+            applyK!(Ap, p);  Ap .= p .- Ap                      # Ap = M p
+            pAp = dot(p, Ap)
+            pAp > 0 || error("mass matrix not positive definite on element ($j, $k): 1 - 2βv_h ≤ 0")
+            a = rr / pAp
+            Xe .+= a .* p;  r .-= a .* Ap
+            rrn = dot(r, r);  p .= r .+ (rrn / rr) .* p;  rr = rrn
+        end
+        sqrt(rr) > tol * r0 && (nfail += 1)
     end
-
-    return ut, vt
+    nfail > 0 && @warn "mass solve: $nfail element systems did not reach the tolerance $tol"
+    return X
 end
