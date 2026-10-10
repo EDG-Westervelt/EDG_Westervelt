@@ -28,7 +28,7 @@ end
 # - :absorbing_2beta  γ = 1/√2, k = 2: absorbing condition with the weight
 #                     √(1-2βv) of the paper's (1.1b), -1 ≤ σ ≤ 1 (default);
 # - :absorbing        γ = 1/√2, k = 1: the alternative weight √(1-βv) of the
-#                     paper's Remark 2.1 (the default of v0.1 and v0.2);
+#                     paper's Remark 4.3 (the default of v0.1 and v0.2);
 # - :dirichlet        γ = 1 (η = 0), k = 1: v* = √(1-βg) g / √(1-βv_h) for the
 #                     boundary data g of v (so v* = 0 for homogeneous data),
 #                     with the penalty σ_D = sigma_dirichlet ≥ 0;
@@ -100,7 +100,7 @@ degree `q_u` for `u_h` and `q_v = q_u - 1` (`mixed = true`) or `q_v = q_u`
   boundary data are chosen consistently (Section 5.1). Returns
   `(erru, errv, errgradu, errE)`, the L² errors of `u`, `v`, the broken
   H¹-seminorm error of `u` and the energy error
-  `‖e‖_E² = ½‖c∇_h e_u‖² + ½‖e_v‖²` at time `T`.
+  `‖e‖_en² = ½‖c∇_h e_u‖² + ½‖e_v‖²` at time `T`.
 - `mode = :initial_value`: initial data `u(0) = Φ`, `u_t(0) = 0`, no source,
   homogeneous boundary conditions except `u = Φ` on Dirichlet sides
   (Section 5.2).
@@ -524,7 +524,7 @@ end
     difference_norms(A, B) -> (erru, errv, errE)
 
 L² norms of `u_A - u_B`, `v_A - v_B` and the energy norm
-`‖e‖_E² = ½‖c∇_h e_u‖² + ½‖e_v‖²` of the difference of two final states
+`‖e‖_en² = ½‖c∇_h e_u‖² + ½‖e_v‖²` of the difference of two final states
 returned by `solve(...; return_state = true)` on the same mesh.
 """
 function difference_norms(A, B)

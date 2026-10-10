@@ -33,7 +33,7 @@ open(joinpath(OUT, "order.csv"), "w") do io
     end
 end
 
-println("\n alpha    ‖e_u‖_L2    order   ‖e‖_E      order")
+println("\n alpha    ‖e_u‖_L2    order   ‖e‖_en     order")
 for i in eachindex(ALPHAS)
     ou = i == 1 ? "  -- " : @sprintf("%5.2f", log10(res[i-1].erru / res[i].erru))
     oE = i == 1 ? "  -- " : @sprintf("%5.2f", log10(res[i-1].errE / res[i].errE))

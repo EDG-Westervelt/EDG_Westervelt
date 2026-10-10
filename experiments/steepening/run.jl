@@ -1,4 +1,4 @@
-# Section 5.3, wave steepening (Section 5.3 of the paper).
+# Section 5.3, wave steepening (the steepening figure of the paper).
 #
 #   julia --project=. experiments/steepening/run.jl              # all three cases
 #   julia --project=. experiments/steepening/run.jl nl lin       # selected cases

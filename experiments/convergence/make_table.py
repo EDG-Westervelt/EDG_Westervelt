@@ -39,7 +39,7 @@ def rate(q, p, f, c):
     return np.polyfit(np.log(h), np.log(e), 1)[0]
 
 
-NORMS = [r"$\|e_u\|_{L^2}$", r"$\|e_v\|_{L^2}$", r"$\|\nabla_h e_u\|_{L^2}$", r"$\|e\|_{E}$"]
+NORMS = [r"$\|e_u\|_{L^2}$", r"$\|e_v\|_{L^2}$", r"$\|\nabla_h e_u\|_{L^2}$", r"$\|e\|_{\rm en}$"]
 FL = [("U", "upwind"), ("C", "central"), ("A", "alternating")]
 QS = sorted({k[0] for k in d})
 

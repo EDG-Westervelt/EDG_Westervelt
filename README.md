@@ -13,7 +13,7 @@ for `v_h`, and integrates in time with classical RK4. Upwind, central and
 alternating interelement fluxes are available. Each side of the square takes
 its own boundary condition: the absorbing boundary condition of the paper
 with the weight `√(1 - 2βv)` (default), the same condition with the
-alternative weight `√(1 - βv)` (Remark 2.1 of the paper), a Dirichlet
+alternative weight `√(1 - βv)` (Remark 4.3 of the paper), a Dirichlet
 condition, or a reflecting wall (see *Boundary conditions* below).
 
 The right-hand side is evaluated for all elements at once: the traces on the
@@ -24,10 +24,21 @@ matrix-free conjugate gradients (see *Implementation notes* below).
 
 ## Installation
 
-The package requires Julia ≥ 1.10. From the repository root:
+The package requires Julia ≥ 1.10. To reproduce the paper, clone the
+repository and instantiate the environment:
 
 ```bash
+git clone https://github.com/EDG-Westervelt/EDG_Westervelt.git
+cd EDG_Westervelt
 julia --project=. -e 'using Pkg; Pkg.instantiate()'
+```
+
+The examples below assume Julia started with `julia --project=.` in the
+repository root. To use the solver from another environment instead:
+
+```julia
+using Pkg
+Pkg.add(url = "https://github.com/EDG-Westervelt/EDG_Westervelt")
 ```
 
 The figure scripts need Python 3 with `numpy` and `matplotlib`
@@ -41,7 +52,9 @@ using WesterveltEDG
 
 # Manufactured-solution test of Section 5.1: q_u = 3, q_v = 2, upwind flux, N = 10, T = 0.1
 e = solve(3, 10, 0.1; flux = :upwind, mixed = true)
-e.erru, e.errv, e.errgradu, e.errE      # ‖e_u‖, ‖e_v‖, ‖∇_h e_u‖, ‖e‖_E at t = T
+e.erru, e.errv, e.errgradu, e.errE      # ‖e_u‖, ‖e_v‖, ‖∇_h e_u‖, ‖e‖_en at t = T
+# (1.0718e-4, 4.5773e-3, 7.1300e-3, 5.9884e-3): the row q = 3, mixed, upwind,
+# N = 10 of data/convergence/results.csv
 ```
 
 The main keywords of `solve` are:
@@ -96,7 +109,9 @@ and `kappa` to 0. The boundary data are those of the manufactured solution
 in `:mms` mode (the keyword `phase` shifts it so that the data are non-zero
 on every side), `u = u(0)` on Dirichlet sides and zero data otherwise in
 `:initial_value` mode, and zero data in `:source` mode. The error analysis
-of the paper covers the two absorbing kinds.
+of the paper covers the two absorbing kinds (`:absorbing` through Remark 4.3);
+the convergence theorem for the nonlinear scheme (Theorem 4.2) assumes
+`-1 < sigma ≤ 1`.
 
 ## Changes in 0.3.0
 
@@ -126,7 +141,7 @@ All experiments use `Δt = h/(10 q_u²)`, as stated in the paper. The
 produced with this step and the default boundary condition `:absorbing_2beta`
 (the steepening comparison case `nl_dbc` uses `:dirichlet`) with v0.3.0
 (2026-10-09). The data of v0.2.0, computed with the weight `√(1 - βv)`, are in
-the git history; the convergence rates and the α → 0 table are the same for
+the git history (commit `55b976b`); the convergence rates and the α → 0 table are the same for
 both weights, and the steepening receiver signals differ by about 1 %. The
 plotting and table scripts read `results/` when it exists and `data/`
 otherwise, so the paper's figures and tables can be rebuilt without rerunning
@@ -142,7 +157,7 @@ than as concurrent `Threads.@spawn` tasks inside one Julia session.
 julia --project=. -e 'using Pkg; Pkg.test()'
 ```
 
-The tests check:
+The suite takes about 2–3 minutes. The tests check:
 
 - the quadrature;
 - that the zero initial state solves the initialization system for the
@@ -170,6 +185,7 @@ src/
 experiments/         drivers and figure scripts for Sections 5.1–5.3
 data/                reference results used in the paper
 test/                test suite; reference_rhs.jl is the v0.1.0 right-hand side
+results/, figures/   written by the drivers and figure scripts (not tracked)
 ```
 
 ## Implementation notes
@@ -215,6 +231,19 @@ the right-hand side):
 
 Memory allocated per evaluation dropped from 12–60 MB to about 0.1 MB. The
 full q_u = 6, N = 25, T = 0.1 run takes 14.5 s instead of 62 s.
+
+## Citation
+
+If you use this code, please cite the paper:
+
+```bibtex
+@unpublished{WangZhang-EDG-Westervelt,
+  author = {Yiwei Wang and Lu Zhang},
+  title  = {Energy-based discontinuous {G}alerkin methods for the {W}estervelt
+            equation with absorbing boundary conditions},
+  note   = {In preparation. Code: \url{https://github.com/EDG-Westervelt/EDG_Westervelt}}
+}
+```
 
 ## License
 
