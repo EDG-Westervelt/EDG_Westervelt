@@ -6,7 +6,7 @@
 # c = 1, α = 1e-6, zero initial data, Gaussian source at (0.15, 0.5) with
 # r0 = 0.05, ω0 = 16π, T_s = 1; upwind flux, q_u = 4, q_v = 3, N = 64, T = 1.8, σ = 0.
 # Cases:
-#   nl     β = 8, absorbing boundary condition
+#   nl     β = 8, absorbing boundary condition (weight √(1-2βv))
 #   lin    β = 0, absorbing boundary condition
 #   nl_dbc β = 8, homogeneous Dirichlet boundary condition
 # Output per case in results/steepening/<case>/:
@@ -14,10 +14,10 @@
 #   series.csv  t, Westervelt energy, max|v_h|, min(1 - 2βv_h)
 #   grid.csv    x and y coordinates of the snapshot grid
 #   snap_<t>.csv  v_h on that grid at t ≈ 0.5, 0.8, 1.1
-# Cases run one after another; each takes on the order of an hour.
+# Cases run one after another; each takes about 20–25 minutes on one core.
 using WesterveltEDG, Printf, DelimitedFiles
 
-const CASES = Dict("nl" => (8.0, :absorbing), "lin" => (0.0, :absorbing), "nl_dbc" => (8.0, :dirichlet))
+const CASES = Dict("nl" => (8.0, :absorbing_2beta), "lin" => (0.0, :absorbing_2beta), "nl_dbc" => (8.0, :dirichlet))
 const OUT = joinpath(@__DIR__, "..", "..", "results", "steepening")
 
 function runcase(name)
@@ -36,7 +36,7 @@ function runcase(name)
     for (ts, G) in H.snaps
         writedlm(joinpath(d, @sprintf("snap_%.2f.csv", ts)), G, ',')
     end
-    @printf("%-7s beta=%.0f %-9s max|v|=%.4f min(1-2βv)=%.4f (%.0f s)\n",
+    @printf("%-7s beta=%.0f %-15s max|v|=%.4f min(1-2βv)=%.4f (%.0f s)\n",
             name, beta, boundary, maximum(H.vmax), minimum(H.ndmin), time() - t0)
 end
 

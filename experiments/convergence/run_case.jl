@@ -6,7 +6,8 @@
 # run all 36 cases and merge them into results/convergence/results.csv.
 #
 # Manufactured solution u = cos(ωt) cos(2πx) sin(2πy), ω = 2√2π, coefficients of
-# Section 5.1, T = 0.1, σ = 0, RK4 with Δt = h/(10 q_u²).
+# Section 5.1, T = 0.1, absorbing boundary condition with the weight √(1-2βv)
+# (default) and σ = 0, RK4 with Δt = h/(10 q_u²).
 using WesterveltEDG, Printf
 
 const q  = parse(Int, ARGS[1])

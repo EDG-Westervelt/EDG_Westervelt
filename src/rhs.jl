@@ -12,7 +12,8 @@
 #
 # The displacement is advanced as ũ = u - u₀ with u₀ the initial profile
 # (see `solve`), which only adds the known terms ∇·(c²∇u₀) to the source and
-# -(c²∇u₀)·n to the boundary data.
+# -(c²∇u₀)·n to the boundary data of the flux c²∇u·n (absorbing and wall
+# sides).
 #
 # Structure of one evaluation (the element- and face-sized arrays are
 # preallocated in a `Workspace`; only small boundary arrays are allocated):
@@ -26,27 +27,58 @@
 #   6. the mass system ∫(1 - 2βv_h) φ v̇_h = R on every element by matrix-free
 #      conjugate gradients (see `_mass_solve_cg!`).
 # The result is that of the element-by-element version of v0.1.0 (kept in
-# test/reference_rhs.jl, dense LU mass solve) up to the order of floating-point
-# operations and the CG tolerance pre.mass_tol = 1e-14 of the mass solve.
+# test/reference_rhs.jl, dense LU mass solve; the boundary kinds added later
+# are compared with it through equivalent parameters) up to the order of
+# floating-point operations and the CG tolerance pre.mass_tol = 1e-14 of the
+# mass solve.
 
-# Pointwise absorbing-boundary flux on a physical boundary face.
-# Inputs are values at the face quadrature points (arrays of any common
-# shape); `*_ex` are the boundary data. Returns (F1, dv): the total numerical
-# normal flux ((c²∇u)* + (α∇v)*)·n entering the v-equation and the v-trace
-# correction v* - v_h.
-@inline function _abc_face(pre, c2f, af, cf, bf, v_fp, grad_u_n, grad_v_n, gu_ex, gv_ex, v_ex)
-    gamma_abc = pre.gamma_abc;  eta_abc = pre.eta_abc;  sigma = pre.sigma
+# Pointwise fluxes on a physical boundary face. Inputs are values at the face
+# quadrature points (arrays of any common shape); `*_ex` are the boundary data.
+# Every kind returns (F1, dv): the total numerical normal flux
+# ((c²∇u)* + (α∇v)*)·n entering the v-equation and the v-trace correction
+# v* - v_h. The lift of (F1, dv) in `_boundary_faces!` is the same for all kinds.
 
+# Boundary family ρ = η (c²∇u + α∇v)·n + γ c √(1-kβv) v with η = √(1-γ²)
+# (see `_boundary_side` in solver.jl); `kb` = k is 1 for the weight √(1-βv)
+# and 2 for √(1-2βv).
+@inline function _abc_face(gamma_abc, eta_abc, sigma, kb, c2f, af, cf, bf, v_fp, grad_u_n, grad_v_n, gu_ex, gv_ex, v_ex)
     rho_num = eta_abc .* (c2f .* grad_u_n .+ af .* grad_v_n) .+
-              gamma_abc .* cf .* sqrt.(1.0 .- bf .* v_fp) .* v_fp
+              gamma_abc .* cf .* sqrt.(1.0 .- kb .* bf .* v_fp) .* v_fp
     rho_ex  = eta_abc .* (c2f .* gu_ex .+ af .* gv_ex) .+
-              gamma_abc .* cf .* sqrt.(1.0 .- bf .* v_ex) .* v_ex
+              gamma_abc .* cf .* sqrt.(1.0 .- kb .* bf .* v_ex) .* v_ex
     rho_net = rho_num .- rho_ex
 
-    sqf = sqrt.(1.0 .- bf .* v_fp)
+    sqf = sqrt.(1.0 .- kb .* bf .* v_fp)
     F1  = c2f .* grad_u_n .+ af .* grad_v_n .- (eta_abc + sigma * gamma_abc) .* rho_net
     dv  = -(gamma_abc - sigma * eta_abc) ./ (cf .* sqf) .* rho_net
     return F1, dv
+end
+
+# Reflecting wall (c²∇u + α∇v)·n = g₂ with g₂ = c² gu_ex + α gv_ex (ũ-form data).
+# Residual ρ_w = (c²∇u_h + α∇v_h)·n - g₂;  v* = v_h - (κ/c) ρ_w and
+# w* = w_h - ½ ρ_w n for w_h ∈ {c²∇u_h, α∇v_h}, so the total numerical normal
+# flux is g₂. Face energy contribution -(κ/c) ρ_w² ≤ 0 when g₂ = 0.
+@inline function _wall_face(kappa, c2f, af, cf, grad_u_n, grad_v_n, gu_ex, gv_ex)
+    g2    = c2f .* gu_ex .+ af .* gv_ex
+    rho_w = c2f .* grad_u_n .+ af .* grad_v_n .- g2
+    dv    = -(kappa ./ cf) .* rho_w
+    return g2, dv
+end
+
+# Flux on one side with the parameters `bs` of its boundary kind.
+@inline function _side_face(bs, c2f, af, cf, bf, v_fp, grad_u_n, grad_v_n, gu_ex, gv_ex, v_ex)
+    bs.kind === :wall && return _wall_face(bs.kappa, c2f, af, cf, grad_u_n, grad_v_n, gu_ex, gv_ex)
+    # the weight needs 1 - kβv > 0 at the face points for the trace v_h and the
+    # data (the mass solve only sees the volume points); a NaN passes these
+    # comparisons and propagates (in :source mode the blow-up check stops it)
+    @inbounds for i in eachindex(bf, v_fp, v_ex)
+        1.0 - bs.kb * bf[i] * v_fp[i] <= 0.0 &&
+            error("boundary weight 1 - $(bs.kb == 2.0 ? "2" : "")βv_h ≤ 0 at a face point ($(bs.kind) side)")
+        1.0 - bs.kb * bf[i] * v_ex[i] <= 0.0 &&
+            error("boundary weight 1 - $(bs.kb == 2.0 ? "2" : "")βg ≤ 0 for the boundary data g ($(bs.kind) side)")
+    end
+    return _abc_face(bs.gamma_abc, bs.eta_abc, bs.sigma, bs.kb, c2f, af, cf, bf, v_fp,
+                     grad_u_n, grad_v_n, gu_ex, gv_ex, v_ex)
 end
 
 """
@@ -246,14 +278,15 @@ function _interior_faces!(Ap, Dp, Fp, Am, Dm, Fm, vM, vP, duM, duP, dvM, dvP,
     return nothing
 end
 
-# Physical boundary faces (absorbing condition with exact data in the
-# manufactured-solution mode, homogeneous otherwise).
+# Physical boundary faces; side s uses the kind pre.bc[s] with exact data in the
+# manufactured-solution mode, -(c²∇u₀)·n in :initial_value mode and zero data in
+# :source mode.
 function _boundary_faces!(ws, pre, ct, st, omega, two_h, N)
     @views begin
         # bottom (y = 0, n = (0,-1)) and top (y = 1, n = (0,+1)): rows 1 and N, along x
-        for (row, frow, sgn, sp, spn, A, D, F, vtr, dutr, dvtr) in
-                ((1, 1,     -1.0, pre.bcB_sp, pre.bcB_spy, ws.AB, ws.DB, ws.FB, ws.vB, ws.duB, ws.dvB),
-                 (N, N + 1,  1.0, pre.bcT_sp, pre.bcT_spy, ws.AT, ws.DT, ws.FT, ws.vT, ws.duT, ws.dvT))
+        for (bs, row, frow, sgn, sp, spn, A, D, F, vtr, dutr, dvtr) in
+                ((pre.bc.bot, 1, 1,     -1.0, pre.bcB_sp, pre.bcB_spy, ws.AB, ws.DB, ws.FB, ws.vB, ws.duB, ws.dvB),
+                 (pre.bc.top, N, N + 1,  1.0, pre.bcT_sp, pre.bcT_spy, ws.AT, ws.DT, ws.FT, ws.vT, ws.duT, ws.dvT))
             c2f = pre.hc2[:, frow, :];  af = pre.haf[:, frow, :]
             cf  = pre.hcf[:, frow, :];  bf = pre.hbf[:, frow, :]
             grad_u_n = sgn .* (two_h .* dutr[:, row, :])
@@ -261,15 +294,15 @@ function _boundary_faces!(ws, pre, ct, st, omega, two_h, N)
             gu_ex = sgn .* (ct .* spn .- spn)              # ∇(u - u₀)·n of the exact solution
             gv_ex = sgn .* (-omega * st .* spn)
             v_ex  = -omega * st .* sp
-            F1, dv = _abc_face(pre, c2f, af, cf, bf, vtr[:, row, :], grad_u_n, grad_v_n, gu_ex, gv_ex, v_ex)
+            F1, dv = _side_face(bs, c2f, af, cf, bf, vtr[:, row, :], grad_u_n, grad_v_n, gu_ex, gv_ex, v_ex)
             A[:, row, :] .= F1
             D[:, row, :] .= sgn .* (af .* dv)
             F[:, row, :] .= -sgn .* (c2f .* dv)
         end
         # left (x = 0, n = (-1,0)) and right (x = 1, n = (+1,0)): columns 1 and N, along y
-        for (col, fcol, sgn, sp, spn, A, D, F, vtr, dutr, dvtr) in
-                ((1, 1,     -1.0, pre.bcL_sp, pre.bcL_spx, ws.AL, ws.DL, ws.FL, ws.vL, ws.duL, ws.dvL),
-                 (N, N + 1,  1.0, pre.bcR_sp, pre.bcR_spx, ws.AR, ws.DR, ws.FR, ws.vR, ws.duR, ws.dvR))
+        for (bs, col, fcol, sgn, sp, spn, A, D, F, vtr, dutr, dvtr) in
+                ((pre.bc.lft, 1, 1,     -1.0, pre.bcL_sp, pre.bcL_spx, ws.AL, ws.DL, ws.FL, ws.vL, ws.duL, ws.dvL),
+                 (pre.bc.rgt, N, N + 1,  1.0, pre.bcR_sp, pre.bcR_spx, ws.AR, ws.DR, ws.FR, ws.vR, ws.duR, ws.dvR))
             c2f = pre.vc2[:, :, fcol];  af = pre.vaf[:, :, fcol]
             cf  = pre.vcf[:, :, fcol];  bf = pre.vbf[:, :, fcol]
             grad_u_n = sgn .* (two_h .* dutr[:, :, col])
@@ -277,7 +310,7 @@ function _boundary_faces!(ws, pre, ct, st, omega, two_h, N)
             gu_ex = sgn .* (ct .* spn .- spn)
             gv_ex = sgn .* (-omega * st .* spn)
             v_ex  = -omega * st .* sp
-            F1, dv = _abc_face(pre, c2f, af, cf, bf, vtr[:, :, col], grad_u_n, grad_v_n, gu_ex, gv_ex, v_ex)
+            F1, dv = _side_face(bs, c2f, af, cf, bf, vtr[:, :, col], grad_u_n, grad_v_n, gu_ex, gv_ex, v_ex)
             A[:, :, col] .= F1
             D[:, :, col] .= sgn .* (af .* dv)
             F[:, :, col] .= -sgn .* (c2f .* dv)

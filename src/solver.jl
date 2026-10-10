@@ -20,13 +20,51 @@ function flux_parameters(flux::Symbol)
     error("unknown flux $flux (expected :upwind, :alternating or :central)")
 end
 
-# Boundary family: ρ = η (c²∇u + α∇v)·n + γ c √(1-βv) v with η = √(1-γ²).
-# γ = 1/√2 gives the absorbing boundary condition, γ = 1 (η = 0) enforces
-# v* = 0, i.e. a homogeneous Dirichlet condition.
-function _boundary_gamma(boundary::Symbol)
-    boundary == :absorbing && return 1.0 / sqrt(2.0)
-    boundary == :dirichlet && return 1.0
-    error("unknown boundary $boundary (expected :absorbing or :dirichlet)")
+# Boundary kinds, chosen per side. The first three are members of the family
+#     ρ = η (c²∇u + α∇v)·n + γ c √(1-kβv) v,   η = √(1-γ²),
+#     ((c²∇u)* + (α∇v)*)·n = (c²∇u_h + α∇v_h)·n - (η + σγ) ρ,
+#     v* = v_h - (γ - ση) ρ / (c √(1-kβv_h)),
+# with ρ the residual against the boundary data:
+# - :absorbing_2beta  γ = 1/√2, k = 2: absorbing condition with the weight
+#                     √(1-2βv) of the paper's (1.1b), -1 ≤ σ ≤ 1 (default);
+# - :absorbing        γ = 1/√2, k = 1: the alternative weight √(1-βv) of the
+#                     paper's Remark 2.1 (the default of v0.1 and v0.2);
+# - :dirichlet        γ = 1 (η = 0), k = 1: v* = √(1-βg) g / √(1-βv_h) for the
+#                     boundary data g of v (so v* = 0 for homogeneous data),
+#                     with the penalty σ_D = sigma_dirichlet ≥ 0;
+# - :wall             reflecting wall (c²∇u + α∇v)·n = g₂ (see `_wall_face`),
+#                     dissipation κ = kappa ≥ 0.
+const BOUNDARY_KINDS = (:absorbing_2beta, :absorbing, :dirichlet, :wall)
+
+function _boundary_side(kind::Symbol, sigma::Float64, sigma_dirichlet::Float64, kappa::Float64)
+    kind === :wall && return (kind = kind, gamma_abc = 0.0, eta_abc = 1.0, sigma = 0.0, kb = 1.0, kappa = kappa)
+    gamma_abc = kind === :dirichlet ? 1.0 : 1.0 / sqrt(2.0)
+    return (kind = kind, gamma_abc = gamma_abc, eta_abc = sqrt(1.0 - gamma_abc^2),
+            sigma = kind === :dirichlet ? sigma_dirichlet : sigma,
+            kb = kind === :absorbing_2beta ? 2.0 : 1.0, kappa = kappa)
+end
+
+# Per-side parameters (bot, top, lft, rgt) from `boundary`: a kind for all four
+# sides, or a NamedTuple with the keys bot (y = 0), top (y = 1), lft (x = 0) and
+# rgt (x = 1) in any order.
+function _boundary_sides(boundary, sigma::Float64, sigma_dirichlet::Float64, kappa::Float64)
+    names = (:bot, :top, :lft, :rgt)
+    if boundary isa Symbol
+        kinds = (boundary, boundary, boundary, boundary)
+    else
+        (length(boundary) == 4 && issetequal(keys(boundary), names)) ||
+            error("boundary must be a kind or a NamedTuple with the keys bot, top, lft, rgt")
+        kinds = map(s -> boundary[s], names)
+    end
+    for kind in kinds
+        kind in BOUNDARY_KINDS || error("unknown boundary $kind (expected one of $(BOUNDARY_KINDS))")
+    end
+    any(k -> k in (:absorbing, :absorbing_2beta), kinds) && !(-1.0 <= sigma <= 1.0) &&
+        error("absorbing sides need -1 ≤ sigma ≤ 1 (got $sigma)")
+    :dirichlet in kinds && !(sigma_dirichlet >= 0.0) &&
+        error("Dirichlet sides need sigma_dirichlet ≥ 0 (got $sigma_dirichlet; it defaults to sigma)")
+    kappa >= 0.0 || error("kappa must be ≥ 0 (got $kappa)")
+    return NamedTuple{names}(map(k -> _boundary_side(k, sigma, sigma_dirichlet, kappa), kinds))
 end
 
 """
@@ -59,21 +97,29 @@ degree `q_u` for `u_h` and `q_v = q_u - 1` (`mixed = true`) or `q_v = q_u`
 # Modes
 - `mode = :mms` (default): manufactured solution `u = cos(ωt) Φ(x)` with
   `Φ = cos(2π kx x) sin(2π ky y)`, `ω = 2π √(kx² + ky²)`; the source and the
-  absorbing boundary data are chosen consistently (Section 5.1). Returns
+  boundary data are chosen consistently (Section 5.1). Returns
   `(erru, errv, errgradu, errE)`, the L² errors of `u`, `v`, the broken
   H¹-seminorm error of `u` and the energy error
   `‖e‖_E² = ½‖c∇_h e_u‖² + ½‖e_v‖²` at time `T`.
 - `mode = :initial_value`: initial data `u(0) = Φ`, `u_t(0) = 0`, no source,
-  homogeneous boundary condition (Section 5.2).
-- `mode = :source`: zero initial data, homogeneous boundary condition and the
+  homogeneous boundary conditions except `u = Φ` on Dirichlet sides
+  (Section 5.2).
+- `mode = :source`: zero initial data, homogeneous boundary conditions and the
   source `source::GaussianSource` (Section 5.3). Returns time series (see
   below).
 
 # Keywords
 - `flux = :upwind`, `flux_params = nothing`: interelement flux; a NamedTuple
   `(theta, tau, lambda_u, lambda_v)` overrides [`flux_parameters`](@ref).
-- `sigma = 0.0`: boundary-flux parameter σ.
-- `boundary = :absorbing` or `:dirichlet`.
+- `boundary = :absorbing_2beta`: the boundary kind of all four sides, or a
+  NamedTuple `(bot, top, lft, rgt)` of kinds for the sides y = 0, y = 1,
+  x = 0, x = 1. Kinds: `:absorbing_2beta` (weight √(1-2βv)), `:absorbing`
+  (weight √(1-βv)), `:dirichlet`, `:wall` (see *Boundary conditions* in the
+  README).
+- `sigma = 0.0`: flux parameter of absorbing sides, -1 ≤ σ ≤ 1.
+- `sigma_dirichlet = sigma`: penalty of Dirichlet sides, ≥ 0.
+- `kappa = 0.0`: dissipation of wall sides, ≥ 0.
+- `phase = (0.0, 0.0)`: shifts `Φ` to `cos(2π kx x + px) sin(2π ky y + py)`.
 - `coefficients = paper_coefficients()`: see [`Coefficients`](@ref).
 - `kx = 1, ky = 1`: wave numbers of Φ.
 - `dt_fac = 10`.
@@ -92,7 +138,10 @@ function solve(q::Int, N::Int, T::Float64;
                flux::Symbol = :upwind,
                flux_params = nothing,
                sigma::Float64 = 0.0,
-               boundary::Symbol = :absorbing,
+               boundary::Union{Symbol,NamedTuple} = :absorbing_2beta,
+               sigma_dirichlet::Float64 = sigma,
+               kappa::Float64 = 0.0,
+               phase::Tuple{Float64,Float64} = (0.0, 0.0),
                coefficients::Coefficients = paper_coefficients(),
                mode::Symbol = :mms,
                kx::Int = 1, ky::Int = 1,
@@ -107,7 +156,8 @@ function solve(q::Int, N::Int, T::Float64;
     mode in (:mms, :initial_value, :source) ||
         error("unknown mode $mode (expected :mms, :initial_value or :source)")
     pre, geo = precompute(q, N; mixed = mixed, flux = flux, flux_params = flux_params,
-                          sigma = sigma, boundary = boundary, coefficients = coefficients,
+                          sigma = sigma, boundary = boundary, sigma_dirichlet = sigma_dirichlet,
+                          kappa = kappa, phase = phase, coefficients = coefficients,
                           mode = mode, kx = kx, ky = ky, source = source)
 
     h  = 1.0 / N
@@ -133,7 +183,7 @@ function solve(q::Int, N::Int, T::Float64;
                 P_u = pre.P_u, P_v = pre.P_v, S_u = geo.S_u, W2d = geo.W2d, err_c2 = geo.err_c2)
     end
     mode == :mms || error("errors are only available in :mms mode; use return_state = true")
-    return _mms_errors(u, v, T, N, h, pre, geo, kx, ky)
+    return _mms_errors(u, v, T, N, h, pre, geo, kx, ky, phase)
 end
 
 """
@@ -174,7 +224,9 @@ evaluation and diagnostics (`geo`). Keywords as in [`solve`](@ref).
 """
 function precompute(q::Int, N::Int;
                     mixed::Bool = true, flux::Symbol = :upwind, flux_params = nothing,
-                    sigma::Float64 = 0.0, boundary::Symbol = :absorbing,
+                    sigma::Float64 = 0.0, boundary::Union{Symbol,NamedTuple} = :absorbing_2beta,
+                    sigma_dirichlet::Float64 = sigma, kappa::Float64 = 0.0,
+                    phase::Tuple{Float64,Float64} = (0.0, 0.0),
                     coefficients::Coefficients = paper_coefficients(),
                     mode::Symbol = :mms, kx::Int = 1, ky::Int = 1,
                     source::GaussianSource = GaussianSource())
@@ -188,7 +240,12 @@ function precompute(q::Int, N::Int;
     fp = flux_params === nothing ? flux_parameters(flux) :
          (theta = Float64(flux_params.theta), tau = Float64(flux_params.tau),
           lambda_u = Float64(flux_params.lambda_u), lambda_v = Float64(flux_params.lambda_v))
-    gamma_abc = _boundary_gamma(boundary)
+    bc = _boundary_sides(boundary, sigma, sigma_dirichlet, kappa)
+    # γ, σ of the uniform legacy kinds, read only by the reference RHS
+    # (test/reference_rhs.jl); NaN for every other boundary
+    legacy    = boundary in (:absorbing, :dirichlet)
+    gamma_abc = legacy ? bc.bot.gamma_abc : NaN
+    px, py    = phase
 
     cC = coefficients.c;  cxC = coefficients.c_x;  cyC = coefficients.c_y
     alphaC = coefficients.alpha;  alphaxC = coefficients.alpha_x;  alphayC = coefficients.alpha_y
@@ -293,9 +350,9 @@ function precompute(q::Int, N::Int;
         Xh = repeat(xloc_h_all[k, :]', q_high, 1)
         Yh = repeat(yloc_h_all[j, :],  1, q_high)
 
-        sp    =  cos.(2π*kx .* Xh) .* sin.(2π*ky .* Yh)
-        sp_x  = -2π*kx .* sin.(2π*kx .* Xh) .* sin.(2π*ky .* Yh)
-        sp_y  =  2π*ky .* cos.(2π*kx .* Xh) .* cos.(2π*ky .* Yh)
+        sp    =  cos.(2π*kx .* Xh .+ px) .* sin.(2π*ky .* Yh .+ py)
+        sp_x  = -2π*kx .* sin.(2π*kx .* Xh .+ px) .* sin.(2π*ky .* Yh .+ py)
+        sp_y  =  2π*ky .* cos.(2π*kx .* Xh .+ px) .* cos.(2π*ky .* Yh .+ py)
         sp_xx = -(2π*kx)^2 .* sp
         sp_yy = -(2π*ky)^2 .* sp
 
@@ -318,17 +375,17 @@ function precompute(q::Int, N::Int;
     bc_rgt_sp  = zeros(N, qu1);  bc_rgt_spx = zeros(N, qu1)
     for k in 1:N
         xq = xloc_all[k, :]
-        bc_bot_sp[k, :]  =  cos.(2π*kx .* xq) .* sin(2π*ky*0)          # y = 0
-        bc_bot_spy[k, :] =  2π*ky .* cos.(2π*kx .* xq) .* cos(2π*ky*0)
-        bc_top_sp[k, :]  =  cos.(2π*kx .* xq) .* sin(2π*ky*1)          # y = 1
-        bc_top_spy[k, :] =  2π*ky .* cos.(2π*kx .* xq) .* cos(2π*ky*1)
+        bc_bot_sp[k, :]  =  cos.(2π*kx .* xq .+ px) .* sin(2π*ky*0 + py)          # y = 0
+        bc_bot_spy[k, :] =  2π*ky .* cos.(2π*kx .* xq .+ px) .* cos(2π*ky*0 + py)
+        bc_top_sp[k, :]  =  cos.(2π*kx .* xq .+ px) .* sin(2π*ky*1 + py)          # y = 1
+        bc_top_spy[k, :] =  2π*ky .* cos.(2π*kx .* xq .+ px) .* cos(2π*ky*1 + py)
     end
     for j in 1:N
         yq = yloc_all[j, :]
-        bc_lft_sp[j, :]  =  cos(2π*kx*0) .* sin.(2π*ky .* yq)          # x = 0
-        bc_lft_spx[j, :] = -2π*kx .* sin(2π*kx*0) .* sin.(2π*ky .* yq)
-        bc_rgt_sp[j, :]  =  cos(2π*kx*1) .* sin.(2π*ky .* yq)          # x = 1
-        bc_rgt_spx[j, :] = -2π*kx .* sin(2π*kx*1) .* sin.(2π*ky .* yq)
+        bc_lft_sp[j, :]  =  cos(2π*kx*0 + px) .* sin.(2π*ky .* yq .+ py)          # x = 0
+        bc_lft_spx[j, :] = -2π*kx .* sin(2π*kx*0 + px) .* sin.(2π*ky .* yq .+ py)
+        bc_rgt_sp[j, :]  =  cos(2π*kx*1 + px) .* sin.(2π*ky .* yq .+ py)          # x = 1
+        bc_rgt_spx[j, :] = -2π*kx .* sin(2π*kx*1 + px) .* sin.(2π*ky .* yq .+ py)
     end
 
     # ---- c² and β at the standard points (errors, diagnostics) ----
@@ -377,7 +434,8 @@ function precompute(q::Int, N::Int;
         bc_lft_sp = bc_lft_sp,  bc_lft_spx = bc_lft_spx,
         bc_rgt_sp = bc_rgt_sp,  bc_rgt_spx = bc_rgt_spx,
         theta = fp.theta,  tau = fp.tau,  lambda_u = fp.lambda_u,  lambda_v = fp.lambda_v,
-        gamma_abc = gamma_abc,  eta_abc = sqrt(1.0 - gamma_abc^2),  sigma = sigma,
+        gamma_abc = gamma_abc,  eta_abc = sqrt(1.0 - gamma_abc^2),  sigma = legacy ? bc.bot.sigma : NaN,
+        bc = bc,
         src_on = src_on,  src_proj = src_proj,  src_time = src_time,
         mms_on = mode == :mms,
     )
@@ -424,7 +482,8 @@ end
 
 # L² errors of u, v, ∇u and the energy error against u = cos(ωT) Φ at time T.
 # The solver stores ũ = u - Φ, so it is compared with (cos(ωT) - 1) Φ.
-function _mms_errors(u, v, T, N, h, pre, geo, kx, ky)
+function _mms_errors(u, v, T, N, h, pre, geo, kx, ky, phase = (0.0, 0.0))
+    px, py = phase
     P_u = pre.P_u;  P_v = pre.P_v;  S_u = geo.S_u;  W2d = geo.W2d;  qu1 = pre.qu1
     erru = 0.0;  errv = 0.0;  errgradu = 0.0;  errE = 0.0
     ct_T = cos(pre.omega * T)
@@ -434,9 +493,9 @@ function _mms_errors(u, v, T, N, h, pre, geo, kx, ky)
         Xq = repeat(geo.xloc[k, :]', qu1, 1)
         Yq = repeat(geo.yloc[j, :],  1, qu1)
 
-        sp    =  cos.(2π*kx .* Xq) .* sin.(2π*ky .* Yq)
-        sp_x  = -2π*kx .* sin.(2π*kx .* Xq) .* sin.(2π*ky .* Yq)
-        sp_y  =  2π*ky .* cos.(2π*kx .* Xq) .* cos.(2π*ky .* Yq)
+        sp    =  cos.(2π*kx .* Xq .+ px) .* sin.(2π*ky .* Yq .+ py)
+        sp_x  = -2π*kx .* sin.(2π*kx .* Xq .+ px) .* sin.(2π*ky .* Yq .+ py)
+        sp_y  =  2π*ky .* cos.(2π*kx .* Xq .+ px) .* cos.(2π*ky .* Yq .+ py)
 
         utrue  =  (ct_T - 1.0) .* sp
         vtrue  = -pre.omega * st_T .* sp

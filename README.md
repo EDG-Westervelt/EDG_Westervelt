@@ -10,9 +10,11 @@ numerical experiments in Section 5 of
 The solver works on the unit square with a uniform Cartesian mesh. It uses
 tensor-product Legendre bases of degree `q_u` for `u_h` and `q_v ∈ {q_u - 1, q_u}`
 for `v_h`, and integrates in time with classical RK4. Upwind, central and
-alternating interelement fluxes are available. On the physical boundary the
-solver imposes the absorbing boundary condition with weight `√(1 - βv)`, or
-optionally a homogeneous Dirichlet condition.
+alternating interelement fluxes are available. Each side of the square takes
+its own boundary condition: the absorbing boundary condition of the paper
+with the weight `√(1 - 2βv)` (default), the same condition with the
+alternative weight `√(1 - βv)` (Remark 2.1 of the paper), a Dirichlet
+condition, or a reflecting wall (see *Boundary conditions* below).
 
 The right-hand side is evaluated for all elements at once: the traces on the
 element sides are obtained by a few large matrix products, every interior
@@ -47,15 +49,66 @@ The main keywords of `solve` are:
 - `mode`: `:mms`, `:initial_value` or `:source`.
 - `flux`: `:upwind`, `:central` or `:alternating`, or custom parameters
   `flux_params = (theta, tau, lambda_u, lambda_v)`.
-- `boundary`: `:absorbing` or `:dirichlet`.
-- `sigma`: the boundary-flux parameter σ.
+- `boundary`: one boundary kind for all four sides, or a NamedTuple
+  `(bot = …, top = …, lft = …, rgt = …)` for the sides y = 0, y = 1, x = 0,
+  x = 1; the kinds are `:absorbing_2beta` (default), `:absorbing`,
+  `:dirichlet` and `:wall`.
+- `sigma`, `sigma_dirichlet`, `kappa`: parameters of the absorbing,
+  Dirichlet and wall fluxes.
 - `coefficients`: see `paper_coefficients`, `constant_coefficients` and
   `replace_coefficients`.
 - `dt_fac`: the time step is `Δt ≈ h/(dt_fac q_u²)`.
 
+For example, three reflecting walls and an absorbing bottom side, with a
+Gaussian source:
+
+```julia
+H = solve(4, 32, 1.0; mode = :source, kappa = 0.5,
+          boundary = (bot = :absorbing_2beta, top = :wall, lft = :wall, rgt = :wall),
+          coefficients = constant_coefficients(c = 1.0, alpha = 1e-6, beta = 8.0))
+```
+
 See `?solve` for the full list. Lower-level, in-place building blocks are
 `precompute`, `Workspace`, `edg_rhs!` and `rk4_step!` (allocating versions:
 `edg_rhs`, `rk4_step`).
+
+## Boundary conditions
+
+With `ψ_h = (c²∇u_h + α∇v_h)·n` and the boundary data of the chosen mode,
+every kind defines the total numerical normal flux `((c²∇u)* + (α∇v)*)·n`
+and the trace `v*` on its side. Each side is treated separately, so any
+combination of kinds is allowed.
+
+| Kind | Condition | Flux | Parameter |
+|---|---|---|---|
+| `:absorbing_2beta` | `c √(1 - 2βv) v + ψ = 0` | eq. (2.16) of the paper | `-1 ≤ sigma ≤ 1` |
+| `:absorbing` | `c √(1 - βv) v + ψ = 0` | eq. (2.16) with `√(1 - βv)` | `-1 ≤ sigma ≤ 1` |
+| `:dirichlet` | `u = g` | `v* = √(1 - βg_t) g_t / √(1 - βv_h)`, penalty `sigma_dirichlet` | `sigma_dirichlet ≥ 0` |
+| `:wall` | `ψ = g₂` | total flux `g₂`, `v* = v_h - (κ/c)(ψ_h - g₂)` | `kappa ≥ 0` |
+
+For homogeneous data, the boundary contribution to the discrete energy is
+non-positive in every case; it vanishes for walls with `kappa = 0` and
+Dirichlet sides with `sigma_dirichlet = 0`. Values outside the stated
+ranges raise an error, as does `1 - 2βv ≤ 0` (`1 - βv ≤ 0` for `:absorbing`
+and `:dirichlet`) for the trace `v_h` or the boundary data at a face
+quadrature point of an absorbing or Dirichlet side. `sigma_dirichlet` defaults to `sigma`
+and `kappa` to 0. The boundary data are those of the manufactured solution
+in `:mms` mode (the keyword `phase` shifts it so that the data are non-zero
+on every side), `u = u(0)` on Dirichlet sides and zero data otherwise in
+`:initial_value` mode, and zero data in `:source` mode. The error analysis
+of the paper covers the two absorbing kinds.
+
+## Changes in 0.3.0
+
+- Boundary conditions per side: `:absorbing_2beta`, `:absorbing`,
+  `:dirichlet`, `:wall`, with the keywords `sigma_dirichlet`, `kappa` and
+  `phase`.
+- The default boundary condition is now `:absorbing_2beta` (weight
+  `√(1 - 2βv)`, eq. (1.1b) of the paper); v0.1 and v0.2 used `:absorbing`
+  (weight `√(1 - βv)`). `data/` was regenerated accordingly.
+- Arguments outside the stable ranges (`|sigma| > 1` on absorbing sides,
+  `sigma_dirichlet < 0`, `kappa < 0`) and a non-positive boundary weight at a
+  face point now raise an error.
 
 ## Reproducing the paper
 
@@ -65,15 +118,16 @@ See `?solve` for the full list. Lower-level, in-place building blocks are
 | | `python3 experiments/convergence/make_table.py` | `figures/convergence/conv_table.tex` | seconds |
 | | `python3 experiments/convergence/plot_panels.py` | `figures/convergence/*.pdf` | seconds |
 | §5.2 α → 0 table | `julia --project=. experiments/alpha_limit/run.jl` | `results/alpha_limit/order.csv` + printed table | about a minute |
-| §5.3 steepening figure | `julia --project=. experiments/steepening/run.jl` | `results/steepening/<case>/` | about 20 minutes per case |
+| §5.3 steepening figure | `julia --project=. experiments/steepening/run.jl` | `results/steepening/<case>/` | about 20–25 minutes per case |
 | | `python3 experiments/steepening/plot.py` | `figures/steepening/*.pdf` | seconds |
 
 All experiments use `Δt = h/(10 q_u²)`, as stated in the paper. The
 `data/` directory holds the reference output used in the paper, all of it
-produced with this step. `data/convergence/` was produced with the current
-code (2026-10-07); the α → 0 and steepening data were produced with the
-element-by-element version of the right-hand side (v0.1.0), which agrees with
-the current one to rounding error. The
+produced with this step and the default boundary condition `:absorbing_2beta`
+(the steepening comparison case `nl_dbc` uses `:dirichlet`) with v0.3.0
+(2026-10-09). The data of v0.2.0, computed with the weight `√(1 - βv)`, are in
+the git history; the convergence rates and the α → 0 table are the same for
+both weights, and the steepening receiver signals differ by about 1 %. The
 plotting and table scripts read `results/` when it exists and `data/`
 otherwise, so the paper's figures and tables can be rebuilt without rerunning
 the simulations. A subset of the convergence sweep can be run with, for
@@ -95,9 +149,14 @@ The tests check:
   manufactured solution;
 - that the right-hand side agrees with the element-by-element implementation
   of v0.1.0 (`test/reference_rhs.jl`, dense LU mass solve) for random states,
-  all fluxes, both degree pairings, all modes and both boundary conditions;
-- regression against `data/convergence/results.csv`;
-- the convergence order on two small meshes.
+  all fluxes, both degree pairings, all modes and every boundary kind;
+- regression against `data/convergence/results.csv` and, for `:absorbing`,
+  against the data of v0.2.0;
+- the boundary fluxes pointwise (consistency and the sign of the boundary
+  energy term), that each side only affects its adjacent elements, the
+  argument checks, and the discrete energy for walls and Dirichlet sides;
+- the initialization and the convergence order on two small meshes for every
+  boundary kind and a mixed configuration.
 
 ## Layout
 
@@ -125,6 +184,10 @@ the elements; (5) volume terms and the u-equation element by element; the
 manufactured source is a combination of four time-independent projections.
 All arrays live in a `Workspace` allocated once per run, and RK4 is done in
 place (`rk4_step!`).
+
+**Interelement penalty.** The jump penalty of the total numerical flux is
+`(c² λ_u + α λ_v)[v_h]`, i.e. the parameters λ_u and λ_v of the flux are
+weighted with the face values of `c²` and `α`.
 
 **Mass systems.** The v-equation requires, on every element and in every
 stage, the solution of `M(v_h) X = R` with

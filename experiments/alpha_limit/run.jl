@@ -3,11 +3,12 @@
 #   julia --project=. experiments/alpha_limit/run.jl
 #
 # Initial data u(0) = cos(2πx) sin(2πy), u_t(0) = 0, no source, homogeneous
-# absorbing boundary condition (σ = 0); c and β as in Section 5.1, constant α.
+# absorbing boundary condition with the weight √(1-2βv) (default, σ = 0); c and
+# β as in Section 5.1, constant α.
 # q_u = 6, q_v = 5, upwind flux, N = 20, T = 0.1, Δt = h/(10 q_u²).
 # The solutions for α ∈ {1e-5, ..., 1e-9} are compared with the numerical
 # solution for α = 0 on the same mesh. Writes results/alpha_limit/order.csv.
-# Runtime: a few minutes.
+# Runtime: about a minute.
 using WesterveltEDG, Printf
 
 const ALPHAS = [1e-5, 1e-6, 1e-7, 1e-8, 1e-9]

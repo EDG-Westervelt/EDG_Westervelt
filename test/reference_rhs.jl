@@ -1,7 +1,8 @@
 # Reference implementation used by the tests: the element-by-element RHS of
 # WesterveltEDG.jl v0.1.0 (commit 4c9ec1d) with the dense LU mass solve,
-# kept verbatim except for the function names. The production RHS in
-# src/rhs.jl must agree with it to rounding error.
+# kept verbatim except for the function names. The boundary kinds of v0.3.0
+# reach it through equivalent parameters (see `reference_pre` in runtests.jl).
+# The production RHS in src/rhs.jl must agree with it to rounding error.
 
 # Semi-discrete right-hand side of the EDG scheme for the Westervelt equation
 # in first-order-in-time form  u_t = v,

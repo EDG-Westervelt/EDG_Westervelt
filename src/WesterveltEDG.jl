@@ -2,7 +2,8 @@
     WesterveltEDG
 
 Energy-based discontinuous Galerkin (EDG) discretization of the Westervelt
-equation with an absorbing boundary condition on the unit square.
+equation on the unit square with absorbing, Dirichlet or reflecting-wall
+boundary conditions, chosen per side.
 """
 module WesterveltEDG
 

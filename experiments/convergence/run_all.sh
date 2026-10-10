@@ -6,7 +6,8 @@
 #   JOBS=4 bash experiments/convergence/run_all.sh          # all degrees
 #   QS="1 2 3" bash experiments/convergence/run_all.sh      # a subset
 #
-# The full sweep takes a few hours on a laptop; q_u = 6 dominates.
+# The full sweep takes about 5 minutes with 8 processes (36 min on one core);
+# q_u = 6 dominates.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 JOBS=${JOBS:-4}
