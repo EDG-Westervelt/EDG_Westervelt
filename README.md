@@ -94,8 +94,8 @@ combination of kinds is allowed.
 
 | Kind | Condition | Flux | Parameter |
 |---|---|---|---|
-| `:absorbing_2beta` | `c √(1 - 2βv) v + ψ = 0` | eq. (2.16) of the paper | `-1 ≤ sigma ≤ 1` |
-| `:absorbing` | `c √(1 - βv) v + ψ = 0` | eq. (2.16) with `√(1 - βv)` | `-1 ≤ sigma ≤ 1` |
+| `:absorbing_2beta` | `c √(1 - 2βv) v + ψ = 0` | eq. (2.12) of the paper | `-1 ≤ sigma ≤ 1` |
+| `:absorbing` | `c √(1 - βv) v + ψ = 0` | eq. (2.12) with `√(1 - βv)` | `-1 ≤ sigma ≤ 1` |
 | `:dirichlet` | `u = g` | `v* = √(1 - βg_t) g_t / √(1 - βv_h)`, penalty `sigma_dirichlet` | `sigma_dirichlet ≥ 0` |
 | `:wall` | `ψ = g₂` | total flux `g₂`, `v* = v_h - (κ/c)(ψ_h - g₂)` | `kappa ≥ 0` |
 
