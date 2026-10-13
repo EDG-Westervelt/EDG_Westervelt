@@ -23,13 +23,16 @@
 #   3. numerical fluxes on all faces at once; every interior face is visited
 #      once and yields the contributions to both neighbouring elements;
 #   4. lift of the face contributions back to the elements;
-#   5. volume terms, manufactured source and the u-equation element by element;
-#   6. the mass system ∫(1 - 2βv_h) φ v̇_h = R on every element by matrix-free
-#      conjugate gradients (see `_mass_solve_cg!`).
+#   5. volume terms matrix-free on all elements at once, the manufactured
+#      source, and the u-equation element by element;
+#   6. the mass system ∫(1 - 2βv_h) φ v̇_h = R on every element, matrix-free,
+#      by Chebyshev iteration on all elements at once (`_mass_solve_cheb!`) or
+#      element-by-element conjugate gradients (`_mass_solve_cg!`), selected by
+#      pre.mass_solver.
 # The result is that of the element-by-element version of v0.1.0 (kept in
 # test/reference_rhs.jl, dense LU mass solve; the boundary kinds added later
 # are compared with it through equivalent parameters) up to the order of
-# floating-point operations and the CG tolerance pre.mass_tol = 1e-14 of the
+# floating-point operations and the tolerance pre.mass_tol = 1e-14 of the
 # mass solve.
 
 # Pointwise fluxes on a physical boundary face. Inputs are values at the face
@@ -107,15 +110,99 @@ function Workspace(pre, N)
      Xw = zeros(nq, N * N), Yv = zeros(nv, N * N), Yu = zeros(nu, N * N),
      Rv = zeros(nv, nv, N, N), Fu = zeros(nu, nu, N, N),
      UT = zeros(nu, nu, N, N), VT = zeros(nv, nv, N, N),
-     bu = zeros(nu * nu), bv = zeros(nv * nv),
      # conjugate-gradient work arrays (one element at a time)
      cg_T1 = zeros(qh, nv), cg_T2 = zeros(nv, qh), cg_Y = zeros(qh, qh), cg_G = zeros(qh, qh),
      cg_r = zeros(nv, nv), cg_p = zeros(nv, nv), cg_Ap = zeros(nv, nv),
+     # volume terms (all elements, layout (mode, element, mode), standard
+     # points nq) and (c²∇φ_u, ∇v_h) in the element-last layout
+     vl_U = zeros(nu, N * N, nu), vl_V = zeros(nv, N * N, nv),
+     vl_G1 = zeros(nq, N * N, nq), vl_G2 = zeros(nq, N * N, nq),
+     vl_H1 = zeros(nq, N * N, nq), vl_H2 = zeros(nq, N * N, nq),
+     vl_Tu = zeros(nq, N * N, nu), vl_Tv = zeros(nq, N * N, nv),
+     vl_Su = zeros(nu, N * N, nq), vl_Sv = zeros(nv, N * N, nq),
+     vl_R = zeros(nv, N * N, nv), vl_B = zeros(nu, N * N, nu), VB = zeros(nu, nu, N, N),
+     # Chebyshev work arrays (all elements, layout (mode, element, mode); the
+     # interval data θ, δ, σ1, ρ per element)
+     ch_Z = zeros(nv, N * N, nv), ch_r = zeros(nv, N * N, nv), ch_d = zeros(nv, N * N, nv),
+     ch_Kd = zeros(nv, N * N, nv), ch_X = zeros(nv, N * N, nv), ch_S = zeros(nv, N * N, qh),
+     ch_T = zeros(qh, N * N, nv), ch_Y = zeros(qh, N * N, qh), ch_G = zeros(qh, N * N, qh),
+     ch_th = zeros(1, N * N, 1), ch_de = zeros(1, N * N, 1), ch_s1 = zeros(1, N * N, 1),
+     ch_rho = zeros(1, N * N, 1), ch_rhon = zeros(1, N * N, 1),
      # outputs in the state layout and RK4 stages
      ut = zeros(N, N, nu, nu), vt = zeros(N, N, nv, nv),
      k1u = zeros(N, N, nu, nu), k2u = zeros(N, N, nu, nu), k3u = zeros(N, N, nu, nu), k4u = zeros(N, N, nu, nu),
      k1v = zeros(N, N, nv, nv), k2v = zeros(N, N, nv, nv), k3v = zeros(N, N, nv, nv), k4v = zeros(N, N, nv, nv),
      su = zeros(N, N, nu, nu), sv = zeros(N, N, nv, nv))
+end
+
+# Contractions of all elements at once for arrays in the layout (mode,
+# element, mode), two matrix products each. Per element,
+#     _contract_fwd!:  out = L Z R'          (Z: n×n, out: m×m, L, R: m×n),
+#     _contract_bwd!:  out = L' H R + β out  (H: m×m, out: n×n, L, R: m×n);
+# the transposed factor is passed explicitly (Rt = R', Lt = L'), and T, S are
+# work arrays of size (m, E, n) and (n, E, m).
+function _contract_fwd!(out, T, L, Rt, Z)
+    n = size(Z, 1);  E = size(Z, 2);  m = size(L, 1)
+    mul!(reshape(T, m, E * n), L, reshape(Z, n, E * n))
+    mul!(reshape(out, m * E, m), reshape(T, m * E, n), Rt)
+    return out
+end
+function _contract_bwd!(out, S, Lt, R, H, β = 0.0)
+    m = size(H, 1);  E = size(H, 2);  n = size(Lt, 1)
+    mul!(reshape(S, n, E * m), Lt, reshape(H, m, E * m))
+    mul!(reshape(out, n * E, n), reshape(S, n * E, m), R, 1.0, β)
+    return out
+end
+
+# Volume terms on all elements at once, matrix-free with the (q_u+1)-point rule:
+#     Rv = (c²∇φ_v, ∇u_h) + (α∇φ_v, ∇v_h),   VB = (c²∇φ_u, ∇v_h)
+# in the reference scaling (Rv is multiplied by -4/h² by the caller). On an
+# element, with P, S the 1D values and derivatives of the basis at the points
+# (rows y, columns x) and C = c²W, A = αW at the points,
+#     (c²∇φ_v, ∇u_h) = S_v' (C ∘ (S_u U P_u')) P_v + P_v' (C ∘ (P_u U S_u')) S_v,
+# and likewise for the other two terms; the gradients of u_h and v_h at the
+# points are computed once.
+function _volume_terms!(Rv, VB, U, V, pre, ws, N)
+    nu = pre.qu1;  nv = pre.qv1;  E = N * N
+    Ua = ws.vl_U;  Va = ws.vl_V;  G1 = ws.vl_G1;  G2 = ws.vl_G2;  H1 = ws.vl_H1;  H2 = ws.vl_H2
+    permutedims!(Ua, reshape(U, nu, nu, E), (1, 3, 2))
+    permutedims!(Va, reshape(V, nv, nv, E), (1, 3, 2))
+    # c²∇u_h at the points
+    _contract_fwd!(G1, ws.vl_Tu, pre.S_u, pre.P_uT, Ua);  _contract_fwd!(G2, ws.vl_Tu, pre.P_u, pre.S_uT, Ua)
+    H1 .= pre.Cw .* G1;  H2 .= pre.Cw .* G2
+    # ∇v_h at the points; H = c²∇u_h + α∇v_h
+    _contract_fwd!(G1, ws.vl_Tv, pre.S_v, pre.P_vT, Va);  _contract_fwd!(G2, ws.vl_Tv, pre.P_v, pre.S_vT, Va)
+    H1 .+= pre.Aw .* G1;  H2 .+= pre.Aw .* G2
+    _contract_bwd!(ws.vl_R, ws.vl_Sv, pre.S_vT, pre.P_v, H1);  _contract_bwd!(ws.vl_R, ws.vl_Sv, pre.P_vT, pre.S_v, H2, 1.0)
+    # c²∇v_h, tested with ∇φ_u
+    G1 .*= pre.Cw;  G2 .*= pre.Cw
+    _contract_bwd!(ws.vl_B, ws.vl_Su, pre.S_uT, pre.P_u, G1);  _contract_bwd!(ws.vl_B, ws.vl_Su, pre.P_uT, pre.S_u, G2, 1.0)
+    permutedims!(reshape(Rv, nv, nv, E), ws.vl_R, (1, 3, 2))
+    permutedims!(reshape(VB, nu, nu, E), ws.vl_B, (1, 3, 2))
+    return nothing
+end
+
+# u-equation on every element: A_e u̇_e = b_e with A_e the c²-stiffness whose
+# constant mode is pinned to the mean condition and
+#     b_e = (c²∇φ_u, ∇v_h) - (lifted face terms) + e₁ (mean of v_h),
+# applied with the stored inverse A_e⁻¹ (mode, mode, element) in a plain loop
+# over the elements, with no library call per element.
+function _u_equation!(UT, VB, Fu, V, Ainv, N)
+    n = size(Ainv, 1);  E = N * N
+    X = reshape(UT, n, E);  B = reshape(VB, n, E);  F = reshape(Fu, n, E)
+    V1 = reshape(V, :, E)
+    @inbounds for e in 1:E
+        for i in 1:n
+            X[i, e] = 0.0
+        end
+        for j in 1:n
+            bj = B[j, e] - F[j, e] + (j == 1 ? V1[1, e] : 0.0)
+            @simd for i in 1:n
+                X[i, e] = muladd(Ainv[i, j, e], bj, X[i, e])
+            end
+        end
+    end
+    return UT
 end
 
 # out[i, j, k] = Σ_b P[i, b] Σ_a E[a] A[a, b, j, k]: trace on the side selected by
@@ -188,18 +275,14 @@ function edg_rhs!(ws, u::Array{Float64,4}, v::Array{Float64,4},
     _boundary_faces!(ws, pre, ct, st, omega, two_h, N)
 
     # ---- 4./5. element residuals: volume, source, lifted face terms ----
-    Rv = ws.Rv;  Fu = ws.Fu;  bv = ws.bv
-    @inbounds for k in 1:N, j in 1:N
-        Ue = vec(view(U, :, :, j, k));  Ve = vec(view(V, :, :, j, k))
-        mul!(bv, pre.Mc2_uv[j, k], Ue)
-        mul!(bv, pre.Ma_vv[j, k], Ve, 1.0, 1.0)
-        view(Rv, :, :, j, k) .= reshape(bv, nv, nv) .* (-four_hh)
-    end
-    # manufactured source: the projection of
+    Rv = ws.Rv;  Fu = ws.Fu
+    _volume_terms!(Rv, ws.VB, U, V, pre, ws, N)
+    # volume terms scaled by -4/h², plus the manufactured source: the
+    # projection of
     #   (1 - 2βv_ex) ∂_t v_ex - ∇·(c²∇u_ex) - ∇·(α∇v_ex) + ∇·(c²∇u₀),
     # u_ex = cos(ωt)Φ, as a combination of time-independent projections
-    Rv .+= (-omega^2 * ct) .* pre.PiSP .+ (-2.0 * omega^3 * st * ct) .* pre.PiBSP2 .+
-           (1.0 - ct) .* pre.PiCdiv .+ (omega * st) .* pre.PiDdiv
+    Rv .= (-four_hh) .* Rv .+ (-omega^2 * ct) .* pre.PiSP .+ (-2.0 * omega^3 * st * ct) .* pre.PiBSP2 .+
+          (1.0 - ct) .* pre.PiCdiv .+ (omega * st) .* pre.PiDdiv
     if pre.src_on
         Rv .+= pre.src_time(t) .* pre.src_projE
     end
@@ -213,22 +296,17 @@ function edg_rhs!(ws, u::Array{Float64,4}, v::Array{Float64,4},
         _lift!(Fu, P_u, w, F, E1u, 1.0,     hz, ws.Xw, ws.Yu)
     end
 
-    # u-equation: (c²∇φ_u, ∇u̇_h) + mean condition, pinned c²-stiffness (Cholesky)
-    bu = ws.bu;  UT = ws.UT
-    @inbounds for k in 1:N, j in 1:N
-        Ve = vec(view(V, :, :, j, k))
-        mul!(bu, transpose(pre.Mc2_uv[j, k]), Ve)
-        bu .-= vec(view(Fu, :, :, j, k))
-        bu[1] += V[1, 1, j, k]
-        R = pre.R_ut[j, k]
-        ldiv!(transpose(R), bu);  ldiv!(R, bu)
-        vec(view(UT, :, :, j, k)) .= bu
-    end
+    # u-equation: (c²∇φ_u, ∇u̇_h) + mean condition, pinned c²-stiffness
+    _u_equation!(ws.UT, ws.VB, Fu, V, pre.Ainv_u, N)
 
     # ---- 6. mass system ----
-    _mass_solve_cg!(ws.VT, V, Rv, pre, ws, N)
+    if pre.mass_solver === :chebyshev
+        _mass_solve_cheb!(ws.VT, V, Rv, pre, ws, N)
+    else
+        _mass_solve_cg!(ws.VT, V, Rv, pre, ws, N)
+    end
 
-    permutedims!(ws.ut, UT, (3, 4, 1, 2))
+    permutedims!(ws.ut, ws.UT, (3, 4, 1, 2))
     permutedims!(ws.vt, ws.VT, (3, 4, 1, 2))
     return ws.ut, ws.vt
 end
@@ -328,9 +406,10 @@ end
 # Since W^{1/2}Φ has orthonormal columns, the eigenvalues of M lie in
 # [min_q (1 - 2β v_q), max_q (1 - 2β v_q)]: M is symmetric positive definite
 # whenever 1 - 2β v_q > 0 at all points, with condition number at most
-# max(1 - 2βv_q)/min(1 - 2βv_q). The system is solved by
-# conjugate gradients, matrix-free and started from X = R (the exact solution
-# for K = 0); relative residual tolerance pre.mass_tol.
+# max(1 - 2βv_q)/min(1 - 2βv_q). Two matrix-free solvers, both to the relative
+# residual tolerance pre.mass_tol: Chebyshev iteration (`_mass_solve_cheb!`,
+# below) and conjugate gradients started from X = R, the exact solution for
+# K = 0 (`_mass_solve_cg!`).
 function _mass_solve_cg!(X, V, Rv, pre, ws, N)
     P = pre.P_h_v;  Pt = pre.P_h_vT;  W = pre.W2d_h;  tol = pre.mass_tol
     nv = pre.qv1;  maxit = nv * nv + 10
@@ -358,5 +437,57 @@ function _mass_solve_cg!(X, V, Rv, pre, ws, N)
         sqrt(rr) > tol * r0 && (nfail += 1)
     end
     nfail > 0 && @warn "mass solve: $nfail element systems did not reach the tolerance $tol"
+    return X
+end
+
+# Chebyshev iteration (Saad, Iterative Methods for Sparse Linear Systems, 2nd
+# ed., Alg. 12.1) for the same systems, on all elements at once. On element e
+# the spectrum of M lies in [a₋, a₊], a± = max/min over the q_high points of
+# 1 - 2β v_q, which is computed for free; with θ = (a₊ + a₋)/2, δ = (a₊ - a₋)/2
+# and X₀ = 0, n steps give the residual polynomial T_n((θ - λ)/δ) / T_n(θ/δ), so
+#     ‖R - M X_n‖ ≤ ‖R‖ / cosh(n acosh(θ/δ)),
+# and n = ⌈acosh(1/tol) / acosh(θ/δ)⌉ reaches the tolerance without any inner
+# product. All elements take the largest n (further steps only reduce the
+# error of the others); a step costs one application of K and n steps n - 1.
+# The vectors are stored as (mode a, element, mode b), so that both
+# contractions of P Z P' and of P' H P are single matrix products over all
+# elements. 1 - 2β v_q ≤ 0 at any point stops the run (the scheme and its
+# analysis need 1 - 2βv_h > 0).
+function _mass_solve_cheb!(X, V, Rv, pre, ws, N)
+    P = pre.P_h_v;  Pt = pre.P_h_vT;  L = acosh(1.0 / pre.mass_tol)
+    nv = pre.qv1;  qh = pre.q_high;  E = N * N
+    Z = ws.ch_Z;  T = ws.ch_T;  S = ws.ch_S;  Y = ws.ch_Y;  G = ws.ch_G
+    r = ws.ch_r;  d = ws.ch_d;  Kd = ws.ch_Kd;  Xs = ws.ch_X
+    θ = ws.ch_th;  δ = ws.ch_de;  σ1 = ws.ch_s1;  ρ = ws.ch_rho;  ρn = ws.ch_rhon
+    # out = P Z P' for Z (nv, E, nv), out (qh, E, qh); out = P' H P the reverse
+    fwd!(out, Z) = _contract_fwd!(out, T, P, Pt, Z)
+    bwd!(out, H) = _contract_bwd!(out, S, Pt, P, H)
+
+    permutedims!(Z, reshape(V, nv, nv, E), (1, 3, 2))
+    fwd!(G, Z);  G .*= 2.0 .* pre.beta_hq                       # 2βv_q
+    n = 1
+    @inbounds for e in 1:E
+        gmin, gmax = extrema(view(G, :, e, :))
+        amin = 1.0 - gmax;  amax = 1.0 - gmin
+        amin > 0 || error("mass matrix not positive definite on element $e: 1 - 2βv_h ≤ 0")
+        θe = 0.5 * (amax + amin)
+        δe = max(0.5 * (amax - amin), 1e-15 * θe)               # δ = 0: one step, X = R/θ
+        θ[e] = θe;  δ[e] = δe;  σ1[e] = θe / δe
+        n = max(n, ceil(Int, L / acosh(σ1[e])))
+    end
+    G .*= pre.W_hq                                              # G = 2βv_q W
+
+    permutedims!(r, reshape(Rv, nv, nv, E), (1, 3, 2))          # r₀ = R
+    d .= r ./ θ;  fill!(Xs, 0.0);  ρ .= 1.0 ./ σ1
+    for step in 1:n
+        Xs .+= d
+        step == n && break
+        fwd!(Y, d);  Y .*= G;  bwd!(Kd, Y)                      # Kd = K d
+        r .-= d .- Kd                                           # r -= M d
+        ρn .= 1.0 ./ (2.0 .* σ1 .- ρ)
+        d .= (ρn .* ρ) .* d .+ (2.0 .* ρn ./ δ) .* r
+        ρ .= ρn
+    end
+    permutedims!(reshape(X, nv, nv, E), Xs, (1, 3, 2))
     return X
 end

@@ -120,9 +120,15 @@ degree `q_u` for `u_h` and `q_v = q_u - 1` (`mixed = true`) or `q_v = q_u`
 - `sigma_dirichlet = sigma`: penalty of Dirichlet sides, ≥ 0.
 - `kappa = 0.0`: dissipation of wall sides, ≥ 0.
 - `phase = (0.0, 0.0)`: shifts `Φ` to `cos(2π kx x + px) sin(2π ky y + py)`.
+- `initial_profile = nothing`: in `:initial_value` mode, a NamedTuple of
+  functions `(u0, u0_x, u0_y, u0_xx, u0_yy)` of `(x, y)` that replaces `Φ` as
+  the initial displacement `u(0)` (with `u_t(0) = 0`).
 - `coefficients = paper_coefficients()`: see [`Coefficients`](@ref).
 - `kx = 1, ky = 1`: wave numbers of Φ.
 - `dt_fac = 10`.
+- `mass_solver = :cg`: solver of the element mass systems, `:cg` (conjugate
+  gradients, element by element) or `:chebyshev` (Chebyshev iteration on all
+  elements at once); both to the relative residual 1e-14.
 - `return_state = false`: in `:mms`/`:initial_value` mode, return the final
   coefficient arrays and quadrature operators instead of the errors
   (see [`difference_norms`](@ref)).
@@ -146,6 +152,8 @@ function solve(q::Int, N::Int, T::Float64;
                mode::Symbol = :mms,
                kx::Int = 1, ky::Int = 1,
                dt_fac::Real = 10,
+               mass_solver::Symbol = :cg,
+               initial_profile = nothing,
                return_state::Bool = false,
                source::GaussianSource = GaussianSource(),
                record_every::Int = 20,
@@ -158,7 +166,8 @@ function solve(q::Int, N::Int, T::Float64;
     pre, geo = precompute(q, N; mixed = mixed, flux = flux, flux_params = flux_params,
                           sigma = sigma, boundary = boundary, sigma_dirichlet = sigma_dirichlet,
                           kappa = kappa, phase = phase, coefficients = coefficients,
-                          mode = mode, kx = kx, ky = ky, source = source)
+                          mode = mode, kx = kx, ky = ky, source = source,
+                          mass_solver = mass_solver, initial_profile = initial_profile)
 
     h  = 1.0 / N
     u  = zeros(N, N, pre.qu1, pre.qu1)     # ũ = u - u₀
@@ -229,7 +238,12 @@ function precompute(q::Int, N::Int;
                     phase::Tuple{Float64,Float64} = (0.0, 0.0),
                     coefficients::Coefficients = paper_coefficients(),
                     mode::Symbol = :mms, kx::Int = 1, ky::Int = 1,
-                    source::GaussianSource = GaussianSource())
+                    source::GaussianSource = GaussianSource(),
+                    mass_solver::Symbol = :cg, initial_profile = nothing)
+    mass_solver in (:cg, :chebyshev) ||
+        error("unknown mass_solver $mass_solver (expected :cg or :chebyshev)")
+    initial_profile === nothing || mode == :initial_value ||
+        error("initial_profile is only available in :initial_value mode")
     q_u = q
     q_v = mixed ? q_u - 1 : q_u
     qu1 = q_u + 1
@@ -285,8 +299,6 @@ function precompute(q::Int, N::Int;
     Phi_xi_u  = kron(P_u, S_u)
     Phi_eta_u = kron(S_u, P_u)
     S_v       = S_u[:, 1:qv1]
-    Phi_xi_v  = kron(P_v, S_v)
-    Phi_eta_v = kron(S_v, P_v)
 
     # ---- quadrature coordinates per element row/column ----
     xloc_all   = zeros(N, qu1)
@@ -300,10 +312,12 @@ function precompute(q::Int, N::Int;
         yloc_h_all[i, :] = xloc_h_all[i, :]
     end
 
-    # ---- volume operators: (c²∇φ_v, ∇u), (α∇φ_v, ∇v), pinned u-stiffness ----
-    Mc2_uv = Matrix{Matrix{Float64}}(undef, N, N)
-    Ma_vv  = Matrix{Matrix{Float64}}(undef, N, N)
-    R_ut   = Matrix{UpperTriangular{Float64, Matrix{Float64}}}(undef, N, N)
+    # ---- volume terms: c²W and αW at the points of every element (point,
+    # element, point; rows y, columns x), applied matrix-free in rhs.jl, and the
+    # inverse of the pinned u-stiffness (mode, mode, element) ----
+    Cw    = zeros(qu1, N * N, qu1)
+    Aw    = zeros(qu1, N * N, qu1)
+    Ainv_u = zeros(qu1^2, qu1^2, N * N)
     for j in 1:N, k in 1:N
         # rows vary in y, columns in x
         Xq = repeat(xloc_all[k, :]', qu1, 1)
@@ -312,13 +326,13 @@ function precompute(q::Int, N::Int;
         cw = vec(cC.(Xq, Yq).^2  .* W2d)
         aw = vec(alphaC.(Xq, Yq) .* W2d)
 
-        Mc2_uv[j, k] = Phi_xi_v' * (cw .* Phi_xi_u) .+ Phi_eta_v' * (cw .* Phi_eta_u)
-        Ma_vv[j, k]  = Phi_xi_v' * (aw .* Phi_xi_v) .+ Phi_eta_v' * (aw .* Phi_eta_v)
+        Cw[:, j + (k - 1) * N, :] = reshape(cw, qu1, qu1)
+        Aw[:, j + (k - 1) * N, :] = reshape(aw, qu1, qu1)
 
         # c²-stiffness with the constant mode pinned (elementwise mean condition)
         Mj = Phi_xi_u' * (cw .* Phi_xi_u) .+ Phi_eta_u' * (cw .* Phi_eta_u)
         Mj[1, 1] += 1.0
-        R_ut[j, k] = cholesky(Symmetric(Mj)).U
+        Ainv_u[:, :, j + (k - 1) * N] = inv(cholesky(Symmetric(Mj)))
     end
 
     # ---- face coefficients (N×N×(q_u+1), one entry per face quadrature point) ----
@@ -350,11 +364,17 @@ function precompute(q::Int, N::Int;
         Xh = repeat(xloc_h_all[k, :]', q_high, 1)
         Yh = repeat(yloc_h_all[j, :],  1, q_high)
 
-        sp    =  cos.(2π*kx .* Xh .+ px) .* sin.(2π*ky .* Yh .+ py)
-        sp_x  = -2π*kx .* sin.(2π*kx .* Xh .+ px) .* sin.(2π*ky .* Yh .+ py)
-        sp_y  =  2π*ky .* cos.(2π*kx .* Xh .+ px) .* cos.(2π*ky .* Yh .+ py)
-        sp_xx = -(2π*kx)^2 .* sp
-        sp_yy = -(2π*ky)^2 .* sp
+        if initial_profile === nothing
+            sp    =  cos.(2π*kx .* Xh .+ px) .* sin.(2π*ky .* Yh .+ py)
+            sp_x  = -2π*kx .* sin.(2π*kx .* Xh .+ px) .* sin.(2π*ky .* Yh .+ py)
+            sp_y  =  2π*ky .* cos.(2π*kx .* Xh .+ px) .* cos.(2π*ky .* Yh .+ py)
+            sp_xx = -(2π*kx)^2 .* sp
+            sp_yy = -(2π*ky)^2 .* sp
+        else
+            ip = initial_profile
+            sp = ip.u0.(Xh, Yh);  sp_x = ip.u0_x.(Xh, Yh);  sp_y = ip.u0_y.(Xh, Yh)
+            sp_xx = ip.u0_xx.(Xh, Yh);  sp_yy = ip.u0_yy.(Xh, Yh)
+        end
 
         cf  = cC.(Xh, Yh);   c2  = cf.^2
         cx  = cxC.(Xh, Yh);  cy  = cyC.(Xh, Yh)
@@ -386,6 +406,19 @@ function precompute(q::Int, N::Int;
         bc_lft_spx[j, :] = -2π*kx .* sin(2π*kx*0 + px) .* sin.(2π*ky .* yq .+ py)
         bc_rgt_sp[j, :]  =  cos(2π*kx*1 + px) .* sin.(2π*ky .* yq .+ py)          # x = 1
         bc_rgt_spx[j, :] = -2π*kx .* sin(2π*kx*1 + px) .* sin.(2π*ky .* yq .+ py)
+    end
+    if initial_profile !== nothing
+        ip = initial_profile
+        for k in 1:N
+            xq = xloc_all[k, :]
+            bc_bot_sp[k, :] = ip.u0.(xq, 0.0);  bc_bot_spy[k, :] = ip.u0_y.(xq, 0.0)
+            bc_top_sp[k, :] = ip.u0.(xq, 1.0);  bc_top_spy[k, :] = ip.u0_y.(xq, 1.0)
+        end
+        for j in 1:N
+            yq = yloc_all[j, :]
+            bc_lft_sp[j, :] = ip.u0.(0.0, yq);  bc_lft_spx[j, :] = ip.u0_x.(0.0, yq)
+            bc_rgt_sp[j, :] = ip.u0.(1.0, yq);  bc_rgt_spx[j, :] = ip.u0_x.(1.0, yq)
+        end
     end
 
     # ---- c² and β at the standard points (errors, diagnostics) ----
@@ -419,11 +452,11 @@ function precompute(q::Int, N::Int;
     pre = (
         qu1 = qu1,  qv1 = qv1,  q_high = q_high,  omega = omega,
         w   = w,
-        P_u = P_u,  P_v = P_v,
+        P_u = P_u,  P_v = P_v,  S_u = S_u,  S_v = S_v,
         Ebl_u = Ebl_u,  Ebr_u = Ebr_u,  E1bl_u = E1bl_u,  E1br_u = E1br_u,
         Ebl_v = Ebl_v,  Ebr_v = Ebr_v,  E1bl_v = E1bl_v,  E1br_v = E1br_v,
         W2d_h = W2d_h,  P_h_v = P_h_v,  Phi2d_h_v = Phi2d_h_v,
-        Mc2_uv = Mc2_uv,  Ma_vv = Ma_vv,  R_ut = R_ut,
+        Cw = Cw,  Aw = Aw,  Ainv_u = Ainv_u,
         bot_c2 = fb.c2,  bot_af = fb.af,  bot_cf = fb.cf,  bot_bf = fb.bf,
         top_c2 = ft.c2,  top_af = ft.af,  top_cf = ft.cf,  top_bf = ft.bf,
         lft_c2 = fl.c2,  lft_af = fl.af,  lft_cf = fl.cf,  lft_bf = fl.bf,
@@ -438,6 +471,7 @@ function precompute(q::Int, N::Int;
         bc = bc,
         src_on = src_on,  src_proj = src_proj,  src_time = src_time,
         mms_on = mode == :mms,
+        mass_solver = mass_solver,
     )
     pre = merge(pre, _rhs_data(pre, N))
     geo = (S_u = S_u, W2d = W2d, xloc = xloc_all, yloc = yloc_all,
@@ -452,7 +486,11 @@ end
 # - boundary data by point: (point, column) on y = 0, 1 and (point, row) on x = 0, 1;
 # - Π(X) = P_h_v' (W ∘ X) P_h_v for X = Φ, βΦ², ∇·(c²∇Φ), ∇·(α∇Φ) per element
 #   (element-last), so that the manufactured source is a combination of them;
-# - β at the high-order points (element-last) and P_h_v' for the mass solve.
+# - β at the high-order points (element-last, and as (point, element, point)
+#   with the weights as (point, 1, point) for the Chebyshev solver) and P_h_v'
+#   for the mass solve;
+# - the transposes of the 1D values and derivatives at the standard points for
+#   the volume terms.
 function _rhs_data(pre, N)
     nq = pre.qu1;  nv = pre.qv1;  qh = pre.q_high
     hface(bot, top) = (A = zeros(nq, N + 1, N);
@@ -477,7 +515,11 @@ function _rhs_data(pre, N)
      PiSP = proj(pre.mms_SP), PiBSP2 = proj(pre.mms_BF .* pre.mms_SP .^ 2),
      PiCdiv = proj(pre.mms_Cdiv), PiDdiv = proj(pre.mms_Ddiv),
      src_projE = elast(pre.src_proj), beta_hE = elast(pre.mms_BF),
-     P_h_vT = permutedims(pre.P_h_v), mass_tol = 1e-14)
+     beta_hq = permutedims(reshape(elast(pre.mms_BF), qh, qh, N * N), (1, 3, 2)),
+     W_hq = reshape(copy(pre.W2d_h), qh, 1, qh),
+     P_h_vT = permutedims(pre.P_h_v), mass_tol = 1e-14,
+     P_uT = permutedims(pre.P_u), S_uT = permutedims(pre.S_u),
+     P_vT = permutedims(pre.P_v), S_vT = permutedims(pre.S_v))
 end
 
 # L² errors of u, v, ∇u and the energy error against u = cos(ωT) Φ at time T.

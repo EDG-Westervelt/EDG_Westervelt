@@ -17,10 +17,13 @@ alternative weight `√(1 - βv)` (Remark 4.3 of the paper), a Dirichlet
 condition, or a reflecting wall (see *Boundary conditions* below).
 
 The right-hand side is evaluated for all elements at once: the traces on the
-element sides are obtained by a few large matrix products, every interior
-face is visited once, and all work arrays are preallocated. The element mass
-systems with the solution-dependent weight `1 - 2βv_h` are solved by
-matrix-free conjugate gradients.
+element sides and the volume terms `(c²∇φ, ∇u_h)`, `(α∇φ, ∇v_h)` are obtained
+by a few large matrix products (sum factorization, without element
+matrices), every interior face is visited once, and all work arrays are
+preallocated. The element mass
+systems with the solution-dependent weight `1 - 2βv_h` are solved
+matrix-free, by conjugate gradients element by element (default) or by
+Chebyshev iteration on all elements at once (`mass_solver = :chebyshev`).
 
 ## Installation
 
@@ -71,6 +74,11 @@ The main keywords of `solve` are:
 - `coefficients`: see `paper_coefficients`, `constant_coefficients` and
   `replace_coefficients`.
 - `dt_fac`: the time step is `Δt ≈ h/(dt_fac q_u²)`.
+- `initial_profile`: in `:initial_value` mode, a NamedTuple of functions
+  `(u0, u0_x, u0_y, u0_xx, u0_yy)` of `(x, y)` giving the initial displacement
+  `u(0)` (default `Φ`).
+- `mass_solver`: `:cg` (default) or `:chebyshev`, the solver of the element
+  mass systems; both stop at the relative residual 1e-14.
 
 For example, three reflecting walls and an absorbing bottom side, with a
 Gaussian source:
@@ -132,7 +140,7 @@ the convergence theorem for the nonlinear scheme (Theorem 4.2) assumes
 | §5.1 convergence figure and table | `JOBS=8 bash experiments/convergence/run_all.sh` | `results/convergence/results.csv` | about 5 minutes with 8 processes (36 min on one core) |
 | | `python3 experiments/convergence/make_table.py` | `figures/convergence/conv_table.tex` | seconds |
 | | `python3 experiments/convergence/plot_panels.py` | `figures/convergence/*.pdf` | seconds |
-| §5.2 α → 0 table | `julia --project=. experiments/alpha_limit/run.jl` | `results/alpha_limit/order.csv` + printed table | about a minute |
+| §5.2 α → 0 table | `julia --project=. experiments/alpha_limit/run.jl` | `results/alpha_limit/order.csv` + printed table | about three minutes |
 | §5.3 steepening figure | `julia --project=. experiments/steepening/run.jl` | `results/steepening/<case>/` | about 20–25 minutes per case |
 | | `python3 experiments/steepening/plot.py` | `figures/steepening/*.pdf` | seconds |
 
@@ -140,9 +148,12 @@ All experiments use `Δt = h/(10 q_u²)`, as stated in the paper. The
 `data/` directory holds the reference output used in the paper, all of it
 produced with this step and the default boundary condition `:absorbing_2beta`
 (the steepening comparison case `nl_dbc` uses `:dirichlet`) with v0.3.0
-(2026-10-09). The data of v0.2.0, computed with the weight `√(1 - βv)`, are in
-the git history (commit `55b976b`); the convergence rates and the α → 0 table are the same for
-both weights, and the steepening receiver signals differ by about 1 %. The
+(2026-10-09; `data/alpha_limit` on 2026-10-12, with the compactly supported
+initial data of `experiments/alpha_limit/run.jl`). The data of v0.2.0,
+computed with the weight `√(1 - βv)` (and, for the α → 0 table, the initial
+data `u(0) = cos(2πx) sin(2πy)`), are in the git history (commit `55b976b`);
+the convergence rates are the same for both weights, and the steepening
+receiver signals differ by about 1 %. The
 plotting and table scripts read `results/` when it exists and `data/`
 otherwise, so the paper's figures and tables can be rebuilt without rerunning
 the simulations. A subset of the convergence sweep can be run with, for
@@ -171,7 +182,11 @@ The suite takes about 2–3 minutes. The tests check:
   energy term), that each side only affects its adjacent elements, the
   argument checks, and the discrete energy for walls and Dirichlet sides;
 - the initialization and the convergence order on two small meshes for every
-  boundary kind and a mixed configuration.
+  boundary kind and a mixed configuration;
+- both mass solvers against a dense solve for `1 - 2βv_h` down to 0.1, and
+  whole runs with `mass_solver = :cg` and `:chebyshev`;
+- that passing the default profile `Φ` as `initial_profile` reproduces the
+  default `:initial_value` run.
 
 ## Layout
 

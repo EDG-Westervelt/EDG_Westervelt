@@ -1,8 +1,23 @@
 using WesterveltEDG
 using Test, Random
+using LinearAlgebra: cholesky, Symmetric
 
 # element-by-element RHS of v0.1.0 with the dense LU mass solve (reference)
 include("reference_rhs.jl")
+
+# The reference reads the dense volume operators and the Cholesky factors of the
+# pinned u-stiffness of v0.1.0 from `pre`; they are rebuilt from the coefficient
+# values at the points (pre.Cw = c²W, pre.Aw = αW).
+function dense_volume(pre)
+    E = size(pre.Cw, 2);  N = isqrt(E)
+    Pxu = kron(pre.P_u, pre.S_u);  Peu = kron(pre.S_u, pre.P_u)
+    Pxv = kron(pre.P_v, pre.S_v);  Pev = kron(pre.S_v, pre.P_v)
+    cw(j, k) = vec(pre.Cw[:, j + (k - 1) * N, :]);  aw(j, k) = vec(pre.Aw[:, j + (k - 1) * N, :])
+    Ku(j, k) = (K = Pxu' * (cw(j, k) .* Pxu) .+ Peu' * (cw(j, k) .* Peu);  K[1, 1] += 1.0;  K)
+    merge(pre, (Mc2_uv = [Pxv' * (cw(j, k) .* Pxu) .+ Pev' * (cw(j, k) .* Peu) for j in 1:N, k in 1:N],
+                Ma_vv  = [Pxv' * (aw(j, k) .* Pxv) .+ Pev' * (aw(j, k) .* Pev) for j in 1:N, k in 1:N],
+                R_ut   = [cholesky(Symmetric(Ku(j, k))).U for j in 1:N, k in 1:N]))
+end
 
 @testset "WesterveltEDG" begin
 
@@ -46,7 +61,7 @@ include("reference_rhs.jl")
         for q in (1, 3, 4), N in (1, 2, 4), flux in (:upwind, :central, :alternating), mixed in (true, false)
             pre, _ = precompute(q, N; flux = flux, mixed = mixed, mode = mode, boundary = boundary, sigma = 0.3)
             u = randn(N, N, pre.qu1, pre.qu1);  v = randn(N, N, pre.qv1, pre.qv1)
-            a = edg_rhs_reference(u, v, 0.037, N, 1.0 / N, pre)
+            a = edg_rhs_reference(u, v, 0.037, N, 1.0 / N, dense_volume(pre))
             b = edg_rhs(u, v, 0.037, N, 1.0 / N, pre)
             worst = max(worst, maximum(abs, a[1] .- b[1]) / maximum(abs, a[1]),
                                maximum(abs, a[2] .- b[2]) / maximum(abs, a[2]))
@@ -123,7 +138,7 @@ include("reference_rhs.jl")
             pre, _ = precompute(q, N; flux = flux, mixed = mixed, mode = mode, boundary = boundary,
                                 sigma = 0.3, sigma_dirichlet = 0.6, kappa = 0.7, phase = (0.4, 0.3))
             u = randn(N, N, pre.qu1, pre.qu1);  v = 0.05 .* randn(N, N, pre.qv1, pre.qv1)
-            worst = max(worst, rhs_rel(edg_rhs_reference(u, v, 0.037, N, 1.0 / N, reference_pre(pre)),
+            worst = max(worst, rhs_rel(edg_rhs_reference(u, v, 0.037, N, 1.0 / N, dense_volume(reference_pre(pre))),
                                        edg_rhs(u, v, 0.037, N, 1.0 / N, pre)))
         end
         @test worst < 1e-12
@@ -138,7 +153,7 @@ include("reference_rhs.jl")
             pre, _ = precompute(q, N; flux_params = fp, mixed = mixed, mode = mode, boundary = boundary,
                                 sigma = 0.3, kappa = 0.7)
             u = randn(N, N, pre.qu1, pre.qu1);  v = 0.05 .* randn(N, N, pre.qv1, pre.qv1)
-            worst = max(worst, rhs_rel(edg_rhs_reference(u, v, 0.037, N, 1.0 / N, reference_pre(pre)),
+            worst = max(worst, rhs_rel(edg_rhs_reference(u, v, 0.037, N, 1.0 / N, dense_volume(reference_pre(pre))),
                                        edg_rhs(u, v, 0.037, N, 1.0 / N, pre)))
         end
         @test worst < 1e-12
@@ -262,5 +277,63 @@ include("reference_rhs.jl")
         e2 = solve(2, 12, 0.1; boundary = boundary, sigma_dirichlet = 1.0, kappa = 1.0, phase = (0.4, 0.3))
         @test log2(e1.erru / e2.erru) > 2.5
         @test log2(e1.errE / e2.errE) > 1.5
+    end
+
+    # ---- mass solvers ----
+    # Chebyshev and CG against a dense solve of M(v_h) X = R, element by element,
+    # for 1 - 2βv_h from close to 1 down to 0.1; then whole runs with both.
+    @testset "mass solvers" begin
+        rng = MersenneTwister(7)
+        for (q, mixed, N) in ((1, true, 3), (3, true, 4), (4, false, 3), (6, true, 2))
+            pre, _ = precompute(q, N; mixed = mixed)
+            ws = Workspace(pre, N)
+            nv = pre.qv1;  B = pre.Phi2d_h_v;  Wv = vec(pre.W2d_h)
+            V0 = randn(rng, nv, nv, N, N);  R = randn(rng, nv, nv, N, N)
+            g0 = maximum(maximum(abs, 2 .* vec(pre.beta_hE[:, :, j, k]) .* (B * vec(V0[:, :, j, k])))
+                         for j in 1:N, k in 1:N)
+            for gmax in (1e-3, 0.5, 0.9)
+                V = V0 .* (gmax / g0)
+                Xref = similar(R)
+                for k in 1:N, j in 1:N
+                    a = 1 .- 2 .* vec(pre.beta_hE[:, :, j, k]) .* (B * vec(V[:, :, j, k]))
+                    M = B' * ((a .* Wv) .* B)
+                    Xref[:, :, j, k] = reshape(M \ vec(R[:, :, j, k]), nv, nv)
+                end
+                Xc = WesterveltEDG._mass_solve_cheb!(similar(R), V, R, pre, ws, N)
+                Xg = WesterveltEDG._mass_solve_cg!(similar(R), V, R, pre, ws, N)
+                @test maximum(abs, Xc .- Xref) <= 1e-12 * maximum(abs, Xref)
+                @test maximum(abs, Xg .- Xref) <= 1e-12 * maximum(abs, Xref)
+            end
+            # v_h = 0: M = I, one step
+            @test WesterveltEDG._mass_solve_cheb!(similar(R), zero(V0), R, pre, ws, N) == R
+            # 1 - 2βv_h ≤ 0 somewhere stops the run
+            @test_throws ErrorException WesterveltEDG._mass_solve_cheb!(similar(R), V0 .* (1.5 / g0), R, pre, ws, N)
+        end
+        for kw in ((mixed = true,), (mixed = false, boundary = :absorbing), (mixed = true, boundary = :dirichlet))
+            e1 = solve(3, 6, 0.1; kw..., mass_solver = :cg)
+            e2 = solve(3, 6, 0.1; kw..., mass_solver = :chebyshev)
+            @test e2.erru ≈ e1.erru rtol = 1e-10
+            @test e2.errv ≈ e1.errv rtol = 1e-10
+            @test e2.errE ≈ e1.errE rtol = 1e-10
+        end
+        co = constant_coefficients(c = 1.0, alpha = 1e-6, beta = 8.0)
+        H1 = solve(3, 8, 0.3; mode = :source, coefficients = co, mass_solver = :cg)
+        H2 = solve(3, 8, 0.3; mode = :source, coefficients = co, mass_solver = :chebyshev)
+        @test maximum(abs, H2.recv .- H1.recv) <= 1e-10 * maximum(abs, H1.recv)
+        @test_throws ErrorException precompute(2, 2; mass_solver = :lu)
+    end
+
+    # ---- initial profile ----
+    @testset "initial profile" begin
+        Φ = (x, y) -> cos(2π*x) * sin(2π*y)
+        prof = (u0 = Φ, u0_x = (x, y) -> -2π * sin(2π*x) * sin(2π*y),
+                u0_y = (x, y) -> 2π * cos(2π*x) * cos(2π*y),
+                u0_xx = (x, y) -> -(2π)^2 * Φ(x, y), u0_yy = (x, y) -> -(2π)^2 * Φ(x, y))
+        co = replace_coefficients(paper_coefficients(); alpha = 1e-6)
+        A = solve(3, 6, 0.05; mode = :initial_value, coefficients = co, return_state = true)
+        B = solve(3, 6, 0.05; mode = :initial_value, coefficients = co, return_state = true,
+                  initial_profile = prof)
+        @test A.u == B.u && A.v == B.v
+        @test_throws ErrorException precompute(2, 2; initial_profile = prof)
     end
 end
