@@ -1,6 +1,6 @@
 using WesterveltEDG
 using Test, Random
-using LinearAlgebra: cholesky, Symmetric
+using LinearAlgebra: cholesky, Symmetric, BLAS
 
 # element-by-element RHS of v0.1.0 with the dense LU mass solve (reference)
 include("reference_rhs.jl")
@@ -106,6 +106,7 @@ end
                     lft_bf = k .* pre.lft_bf, rgt_bf = k .* pre.rgt_bf))
     end
     MIXED = (bot = :absorbing_2beta, top = :dirichlet, lft = :wall, rgt = :absorbing)
+    MIXED2 = (bot = :wall, top = :absorbing, lft = :dirichlet, rgt = :absorbing_2beta)
 
     @testset "boundary spellings (bitwise)" begin
         e = solve(2, 4, 0.05)
@@ -321,6 +322,163 @@ end
         H2 = solve(3, 8, 0.3; mode = :source, coefficients = co, mass_solver = :chebyshev)
         @test maximum(abs, H2.recv .- H1.recv) <= 1e-10 * maximum(abs, H1.recv)
         @test_throws ErrorException precompute(2, 2; mass_solver = :lu)
+    end
+
+    # ---- multithreading ----
+    # Every number of blocks gives the same result bit for bit. The blocks run
+    # as parallel tasks, on one thread as well; N is odd, so that the blocks
+    # differ in size and mesh columns are split between them.
+    @info "multithreading tests on $(Threads.nthreads()) Julia thread(s)"
+    @testset "blocks: bitwise RHS and RK4 ($solver, q_u = $q)" for solver in (:chebyshev, :cg), q in (1, 2, 3, 6)
+        N = 7;  h = 1.0 / N
+        nblas = BLAS.get_num_threads();  BLAS.set_num_threads(1)
+        try
+            for mixed in (true, false), mode in (:mms, :initial_value, :source), boundary in (MIXED, MIXED2)
+                pre, _ = precompute(q, N; mixed = mixed, mode = mode, boundary = boundary, mass_solver = solver,
+                                    sigma = 0.3, sigma_dirichlet = 0.6, kappa = 0.7, phase = (0.4, 0.3))
+                rng = MersenneTwister(q)
+                u = 1e-2 .* randn(rng, N, N, pre.qu1, pre.qu1);  v = 0.05 .* randn(rng, N, N, pre.qv1, pre.qv1)
+                ws1 = Workspace(pre, N; nblocks = 1)
+                r1 = copy.(edg_rhs!(ws1, u, v, 0.037, N, h, pre))
+                s1 = (copy(u), copy(v))
+                for k in 1:2
+                    rk4_step!(s1..., 0.01k, 1e-4, N, h, pre, ws1)
+                end
+                for nb in (3, 5, 8)
+                    ws = Workspace(pre, N; nblocks = nb)
+                    @test ws.nb == nb
+                    @test edg_rhs!(ws, u, v, 0.037, N, h, pre) == r1
+                    s = (copy(u), copy(v))
+                    for k in 1:2
+                        rk4_step!(s..., 0.01k, 1e-4, N, h, pre, ws)
+                    end
+                    @test s == s1
+                end
+            end
+        finally
+            BLAS.set_num_threads(nblas)
+        end
+    end
+
+    # Chebyshev step counts that differ between the blocks: 1 - 2βv_h spreads
+    # over [0.45, 1.55] on the first two mesh columns (about 28 steps) and stays
+    # close to 1 elsewhere; all elements take the largest count.
+    @testset "blocks: Chebyshev step counts" begin
+        N = 9;  h = 1.0 / N
+        co = replace_coefficients(paper_coefficients(); beta = 8.0)
+        pre, _ = precompute(4, N; coefficients = co, mode = :source)
+        rng = MersenneTwister(5)
+        u = 1e-3 .* randn(rng, N, N, pre.qu1, pre.qu1);  v = 1e-4 .* randn(rng, N, N, pre.qv1, pre.qv1)
+        v[:, 1:2, 2, 1] .= 0.04
+        r1 = edg_rhs(u, v, 0.1, N, h, pre; nblocks = 1)
+        for nb in (2, 3, 5, 8, 20)
+            ws = Workspace(pre, N; nblocks = nb)
+            @test edg_rhs!(ws, u, v, 0.1, N, h, pre) == r1
+            @test maximum(ws.nsteps) > 20 && minimum(ws.nsteps) < 10
+        end
+    end
+
+    @testset "blocks: solve ($solver, $mode)" for solver in (:chebyshev, :cg), mode in (:mms, :initial_value, :source)
+        nblas = BLAS.get_num_threads()
+        for (q, mixed) in ((1, false), (2, true), (3, false), (6, true))
+            sol(nb) = solve(q, 7, 0.01; mixed = mixed, mode = mode, mass_solver = solver, nblocks = nb,
+                            boundary = MIXED, sigma = 0.3, sigma_dirichlet = 0.6, kappa = 0.7,
+                            return_state = mode === :initial_value)
+            r1 = sol(1)
+            for nb in (3, 5, 8)
+                @test sol(nb) == r1
+            end
+        end
+        @test BLAS.get_num_threads() == nblas
+    end
+
+    # concurrent runs in one session: same results, BLAS threads restored at the end
+    @testset "blocks: concurrent solves" begin
+        nblas = BLAS.get_num_threads()
+        r1 = solve(2, 7, 0.01; nblocks = 1)
+        tasks = [Threads.@spawn solve(2, 7, 0.01; nblocks = nb) for nb in (3, 5, 8, 3)]
+        @test all(==(r1), fetch.(tasks))
+        @test BLAS.get_num_threads() == nblas
+    end
+
+    # errors raised inside the parallel regions keep their type and message, and
+    # the first one in the order of the serial loops is reported
+    @testset "blocks: errors" begin
+        N = 8;  h = 1.0 / N
+        co = replace_coefficients(paper_coefficients(); alpha = 1e-6, beta = 1.0)
+        geterr(f) = try f(); nothing catch e; e end
+        bd = (bot = :absorbing_2beta, top = :absorbing, lft = :absorbing, rgt = :wall)
+        for solver in (:chebyshev, :cg)
+            pre, _ = precompute(3, N; coefficients = co, boundary = bd, mass_solver = solver)
+            u = zeros(N, N, pre.qu1, pre.qu1)
+            # non-positive weights on the bottom side (last column) and on the left
+            # side (row 4), where the mass matrices fail as well
+            v = zeros(N, N, pre.qv1, pre.qv1);  v[1, N, 1, 1] = 2.5;  v[4, 1, 1, 1] = 2.5
+            # non-positive mass matrices on the interior elements (5, 2) and (4, 6)
+            w = zeros(N, N, pre.qv1, pre.qv1);  w[4, 6, 1, 1] = 2.5;  w[5, 2, 1, 1] = 2.5
+            mass_msg = solver === :chebyshev ? "mass matrix not positive definite on element 13: 1 - 2βv_h ≤ 0" :
+                                               "mass matrix not positive definite on element (5, 2): 1 - 2βv_h ≤ 0"
+            for nb in (1, 3, 8)
+                e = geterr(() -> edg_rhs(u, v, 0.0, N, h, pre; nblocks = nb))
+                @test e isa ErrorException && e.msg == "boundary weight 1 - 2βv_h ≤ 0 at a face point (absorbing_2beta side)"
+                e = geterr(() -> edg_rhs(u, w, 0.0, N, h, pre; nblocks = nb))
+                @test e isa ErrorException && e.msg == mass_msg
+            end
+        end
+        # boundary data with 1 - βg ≤ 0 (manufactured solution, β = 1), first on the left side
+        pre, _ = precompute(3, N; coefficients = co, phase = (0.4, 0.3),
+                            boundary = (bot = :wall, top = :wall, lft = :absorbing, rgt = :absorbing_2beta))
+        for nb in (1, 3, 8)
+            e = geterr(() -> edg_rhs(zeros(N, N, pre.qu1, pre.qu1), zeros(N, N, pre.qv1, pre.qv1), 0.07, N, h, pre;
+                                     nblocks = nb))
+            @test e isa ErrorException && e.msg == "boundary weight 1 - βg ≤ 0 for the boundary data g (absorbing side)"
+        end
+        @test_throws ErrorException Workspace(pre, N; nblocks = 0)
+        @test Workspace(pre, 3; nblocks = 8).nb == 2
+        # other errors inside a task are rethrown as the TaskFailedException
+        @test geterr(() -> WesterveltEDG._foreach_block(b -> b >= 2 && throw(DomainError(b)), 4)) isa TaskFailedException
+        e = geterr(() -> WesterveltEDG._foreach_block(b -> b >= 2 && error("block $b"), 4))
+        @test e isa ErrorException && e.msg == "block 2"
+    end
+
+    # state, workspace and pre of different sizes are refused before the kernels
+    # (which index with @inbounds); the default number of blocks
+    @testset "blocks: sizes and default" begin
+        pre, _ = precompute(2, 8);  pre9, _ = precompute(2, 9)
+        for nb in (1, 3)
+            @test_throws DimensionMismatch edg_rhs(zeros(8, 8, 3, 3), zeros(8, 7, 2, 2), 0.0, 8, 1 / 8, pre; nblocks = nb)
+            @test_throws DimensionMismatch edg_rhs!(Workspace(pre9, 9; nblocks = nb), zeros(8, 8, 3, 3), zeros(8, 8, 2, 2),
+                                                    0.0, 8, 1 / 8, pre)
+        end
+        @test_throws DimensionMismatch edg_rhs(zeros(8, 8, 3, 3), zeros(8, 8, 2, 2), 0.0, 8, 1 / 8, pre9)
+        @test Workspace(pre, 8).nb == 1                                     # N²(q_u+1)² = 576
+        @test Workspace(precompute(4, 16)[1], 16).nb == min(4, Threads.nthreads())    # 6400
+        @test Workspace(precompute(4, 32)[1], 32).nb == Threads.nthreads()            # 25600
+    end
+
+    # the energy diagnostics of :source mode (plain loops on the blocks) equal
+    # the serial expressions with the products of `*`, bit for bit
+    @testset "blocks: energy diagnostics" begin
+        N = 5;  h = 1.0 / N
+        for q in 1:6, mixed in (true, false)
+            pre, geo = precompute(q, N; mixed = mixed, mode = :source,
+                                  coefficients = replace_coefficients(paper_coefficients(); beta = 6.0))
+            rng = MersenneTwister(q)
+            u = 1e-2 .* randn(rng, N, N, pre.qu1, pre.qu1);  v = 1e-2 .* randn(rng, N, N, pre.qv1, pre.qv1)
+            ws = Workspace(pre, N; nblocks = 3)
+            dg = WesterveltEDG._diag_workspace(pre, N, ws)
+            WesterveltEDG._energy_diag!(dg, u, v, pre, geo, N, h, ws)
+            same = true
+            for k in 1:N, j in 1:N
+                ux = (2/h) .* (pre.P_u * u[j,k,:,:] * geo.S_u');  uy = (2/h) .* (geo.S_u * u[j,k,:,:] * pre.P_u')
+                vh = pre.P_v * v[j,k,:,:] * pre.P_v'
+                c2q = geo.err_c2[j,k,:,:];  bq = geo.err_beta[j,k,:,:];  e = j + (k - 1) * N
+                same &= dg.E[e] == (h^2/4) * sum(geo.W2d .* (0.5 .* c2q .* (ux.^2 .+ uy.^2)
+                                                             .+ (0.5 .- (2/3) .* bq .* vh) .* vh.^2))
+                same &= dg.vmax[e] == maximum(abs.(vh)) && dg.ndmin[e] == minimum(1 .- 2 .* bq .* vh)
+            end
+            @test same
+        end
     end
 
     # ---- initial profile ----

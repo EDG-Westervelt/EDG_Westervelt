@@ -126,9 +126,16 @@ degree `q_u` for `u_h` and `q_v = q_u - 1` (`mixed = true`) or `q_v = q_u`
 - `coefficients = paper_coefficients()`: see [`Coefficients`](@ref).
 - `kx = 1, ky = 1`: wave numbers of Φ.
 - `dt_fac = 10`.
-- `mass_solver = :cg`: solver of the element mass systems, `:cg` (conjugate
-  gradients, element by element) or `:chebyshev` (Chebyshev iteration on all
-  elements at once); both to the relative residual 1e-14.
+- `mass_solver = :chebyshev`: solver of the element mass systems,
+  `:chebyshev` (Chebyshev iteration on all elements at once) or `:cg`
+  (conjugate gradients, element by element); both to the relative residual
+  1e-14.
+- `nblocks = nothing`: number of element blocks evaluated as parallel tasks
+  (at most `N²÷4`); the default chooses from the size of the problem, one
+  block per Julia thread on large meshes (see [`Workspace`](@ref)). The
+  results do not depend on it. Start Julia with threads (`julia -t 8`) for a
+  speedup. While more than one block is used, BLAS runs with one thread; the
+  previous number of BLAS threads is restored when `solve` returns.
 - `return_state = false`: in `:mms`/`:initial_value` mode, return the final
   coefficient arrays and quadrature operators instead of the errors
   (see [`difference_norms`](@ref)).
@@ -152,7 +159,8 @@ function solve(q::Int, N::Int, T::Float64;
                mode::Symbol = :mms,
                kx::Int = 1, ky::Int = 1,
                dt_fac::Real = 10,
-               mass_solver::Symbol = :cg,
+               mass_solver::Symbol = :chebyshev,
+               nblocks::Union{Nothing,Integer} = nothing,
                initial_profile = nothing,
                return_state::Bool = false,
                source::GaussianSource = GaussianSource(),
@@ -163,11 +171,13 @@ function solve(q::Int, N::Int, T::Float64;
 
     mode in (:mms, :initial_value, :source) ||
         error("unknown mode $mode (expected :mms, :initial_value or :source)")
-    pre, geo = precompute(q, N; mixed = mixed, flux = flux, flux_params = flux_params,
-                          sigma = sigma, boundary = boundary, sigma_dirichlet = sigma_dirichlet,
-                          kappa = kappa, phase = phase, coefficients = coefficients,
-                          mode = mode, kx = kx, ky = ky, source = source,
-                          mass_solver = mass_solver, initial_profile = initial_profile)
+    pre, geo = _with_session_blas() do
+        precompute(q, N; mixed = mixed, flux = flux, flux_params = flux_params,
+                   sigma = sigma, boundary = boundary, sigma_dirichlet = sigma_dirichlet,
+                   kappa = kappa, phase = phase, coefficients = coefficients,
+                   mode = mode, kx = kx, ky = ky, source = source,
+                   mass_solver = mass_solver, initial_profile = initial_profile)
+    end
 
     h  = 1.0 / N
     u  = zeros(N, N, pre.qu1, pre.qu1)     # ũ = u - u₀
@@ -176,15 +186,19 @@ function solve(q::Int, N::Int, T::Float64;
     nsteps = round(Int, T / dt)
     dt = T / nsteps
 
-    mode == :source && return _run_source(u, v, dt, nsteps, N, h, pre, geo;
-                                          record_every = record_every, slice_y = slice_y,
-                                          receivers = receivers, snap_times = snap_times)
-
-    t = 0.0
-    ws = Workspace(pre, N)
-    for _ in 1:nsteps
-        rk4_step!(u, v, t, dt, N, h, pre, ws)
-        t += dt
+    ws = Workspace(pre, N; nblocks = nblocks)
+    counted = _blas_single!(ws)
+    try
+        mode == :source && return _run_source(u, v, dt, nsteps, N, h, pre, geo, ws;
+                                              record_every = record_every, slice_y = slice_y,
+                                              receivers = receivers, snap_times = snap_times)
+        t = 0.0
+        for _ in 1:nsteps
+            rk4_step!(u, v, t, dt, N, h, pre, ws)
+            t += dt
+        end
+    finally
+        _blas_restore(counted)
     end
 
     if return_state
@@ -195,34 +209,116 @@ function solve(q::Int, N::Int, T::Float64;
     return _mms_errors(u, v, T, N, h, pre, geo, kx, ky, phase)
 end
 
+# One BLAS thread while a workspace runs its blocks as parallel tasks (each
+# task makes its own BLAS calls). The runs that need it are counted, so that
+# concurrent runs in one session restore the previous number of BLAS threads
+# only when the last of them ends. `_blas_single!` returns whether it counted
+# the run, for `_blas_restore`.
+const _BLAS_LOCK = ReentrantLock()
+const _BLAS_RUNS = Ref(0)
+const _BLAS_SAVED = Ref(0)
+function _blas_single!(ws)
+    ws.nb == 1 && return false
+    lock(_BLAS_LOCK) do
+        if _BLAS_RUNS[] == 0
+            _BLAS_SAVED[] = BLAS.get_num_threads()
+            BLAS.set_num_threads(1)
+        end
+        _BLAS_RUNS[] += 1
+    end
+    return true
+end
+function _blas_restore(counted::Bool)
+    counted || return nothing
+    lock(_BLAS_LOCK) do
+        _BLAS_RUNS[] -= 1
+        _BLAS_RUNS[] == 0 && BLAS.set_num_threads(_BLAS_SAVED[])
+    end
+    return nothing
+end
+
+# f() with the number of BLAS threads of the session, also while other runs
+# hold BLAS at one thread: the LAPACK inverse of the element stiffness in
+# `precompute` depends on that number in the last bits. With concurrent runs
+# in one session this raises the BLAS threads (and holds the lock) for the
+# whole of `precompute` while the other runs make BLAS calls from their
+# parallel regions. Whether changing the thread count with calls in flight is
+# safe depends on OpenBLAS internals; no effect on the results or the speed of
+# the other runs was measured, but such runs are better started as separate
+# processes (README).
+function _with_session_blas(f)
+    lock(_BLAS_LOCK) do
+        _BLAS_RUNS[] > 0 && BLAS.set_num_threads(_BLAS_SAVED[])
+        try
+            return f()
+        finally
+            _BLAS_RUNS[] > 0 && BLAS.set_num_threads(1)
+        end
+    end
+end
+
 """
     rk4_step!(u, v, t, dt, N, h, pre, ws) -> (u, v)
 
 One step of the classical fourth-order Runge–Kutta method, in place, with the
-workspace `ws = Workspace(pre, N)`.
+workspace `ws = Workspace(pre, N; nblocks)`. The stages are evaluated
+straight into `ws.k1u, …, ws.k4v`, and the stage and final updates of the
+state run on `ws.nb` parallel tasks as well (on contiguous ranges of the
+arrays); the result does not depend on `ws.nb`. As for [`edg_rhs!`](@ref),
+keep BLAS at one thread when `ws.nb > 1`. Afterwards `all(ws.fin)` tells
+whether all entries of `u` and `v` are finite.
 """
 function rk4_step!(u, v, t, dt, N, h, pre, ws)
     su = ws.su;  sv = ws.sv
-    function stage!(ku, kv, tt)
-        a, b = edg_rhs!(ws, su, sv, tt, N, h, pre)
-        ku .= a;  kv .= b
-    end
-    su .= u;  sv .= v;                                         stage!(ws.k1u, ws.k1v, t)
-    su .= u .+ 0.5*dt .* ws.k1u;  sv .= v .+ 0.5*dt .* ws.k1v;  stage!(ws.k2u, ws.k2v, t + 0.5*dt)
-    su .= u .+ 0.5*dt .* ws.k2u;  sv .= v .+ 0.5*dt .* ws.k2v;  stage!(ws.k3u, ws.k3v, t + 0.5*dt)
-    su .= u .+     dt .* ws.k3u;  sv .= v .+     dt .* ws.k3v;  stage!(ws.k4u, ws.k4v, t +     dt)
-    u .= u .+ (dt/6.0) .* (ws.k1u .+ 2.0 .* ws.k2u .+ 2.0 .* ws.k3u .+ ws.k4u)
-    v .= v .+ (dt/6.0) .* (ws.k1v .+ 2.0 .* ws.k2v .+ 2.0 .* ws.k3v .+ ws.k4v)
+    _edg_rhs!(ws.k1u, ws.k1v, ws, u, v, t, N, h, pre)
+    _rk4_stage!(su, sv, u, v, 0.5*dt, ws.k1u, ws.k1v, ws);  _edg_rhs!(ws.k2u, ws.k2v, ws, su, sv, t + 0.5*dt, N, h, pre)
+    _rk4_stage!(su, sv, u, v, 0.5*dt, ws.k2u, ws.k2v, ws);  _edg_rhs!(ws.k3u, ws.k3v, ws, su, sv, t + 0.5*dt, N, h, pre)
+    _rk4_stage!(su, sv, u, v,     dt, ws.k3u, ws.k3v, ws);  _edg_rhs!(ws.k4u, ws.k4v, ws, su, sv, t +     dt, N, h, pre)
+    _rk4_final!(u, v, dt/6.0, ws)
     return u, v
 end
 
+# su = u + c ku, sv = v + c kv
+function _rk4_stage!(su, sv, u, v, c, ku, kv, ws)
+    nb = ws.nb
+    _foreach_block(nb) do b
+        r = _chunk(length(su), nb, b);  x = view(su, r);  x .= view(u, r) .+ c .* view(ku, r)
+        r = _chunk(length(sv), nb, b);  y = view(sv, r);  y .= view(v, r) .+ c .* view(kv, r)
+    end
+    return nothing
+end
+
+# u += c (k1 + 2 k2 + 2 k3 + k4), likewise v; ws.fin[b] tells whether the
+# updated entries of block b are finite (the blow-up check of :source mode)
+function _rk4_final!(u, v, c, ws)
+    nb = ws.nb
+    _foreach_block(nb) do b
+        r = _chunk(length(u), nb, b);  x = view(u, r)
+        x .= x .+ c .* (view(ws.k1u, r) .+ 2.0 .* view(ws.k2u, r) .+ 2.0 .* view(ws.k3u, r) .+ view(ws.k4u, r))
+        r = _chunk(length(v), nb, b);  y = view(v, r)
+        y .= y .+ c .* (view(ws.k1v, r) .+ 2.0 .* view(ws.k2v, r) .+ 2.0 .* view(ws.k3v, r) .+ view(ws.k4v, r))
+        ws.fin[b] = all(isfinite, x) && all(isfinite, y)
+    end
+    return nothing
+end
+
 """
-    rk4_step(u, v, t, dt, N, h, pre) -> (u, v)
+    rk4_step(u, v, t, dt, N, h, pre; nblocks = nothing) -> (u, v)
 
 One step of the classical fourth-order Runge–Kutta method (allocating
-version of [`rk4_step!`](@ref); `u`, `v` are not modified).
+version of [`rk4_step!`](@ref) with `Workspace(pre, N; nblocks)`; `u`, `v`
+are not modified). With more than one block, BLAS runs with one thread
+during the step, as in [`solve`](@ref).
 """
-rk4_step(u, v, t, dt, N, h, pre) = rk4_step!(copy(u), copy(v), t, dt, N, h, pre, Workspace(pre, N))
+function rk4_step(u, v, t, dt, N, h, pre; nblocks::Union{Nothing,Integer} = nothing)
+    ws = Workspace(pre, N; nblocks = nblocks)
+    counted = _blas_single!(ws)
+    try
+        return rk4_step!(copy(u), copy(v), t, dt, N, h, pre, ws)
+    finally
+        _blas_restore(counted)
+    end
+end
 
 """
     precompute(q_u, N; kwargs...) -> (pre, geo)
@@ -239,7 +335,7 @@ function precompute(q::Int, N::Int;
                     coefficients::Coefficients = paper_coefficients(),
                     mode::Symbol = :mms, kx::Int = 1, ky::Int = 1,
                     source::GaussianSource = GaussianSource(),
-                    mass_solver::Symbol = :cg, initial_profile = nothing)
+                    mass_solver::Symbol = :chebyshev, initial_profile = nothing)
     mass_solver in (:cg, :chebyshev) ||
         error("unknown mass_solver $mass_solver (expected :cg or :chebyshev)")
     initial_profile === nothing || mode == :initial_value ||
@@ -314,10 +410,12 @@ function precompute(q::Int, N::Int;
 
     # ---- volume terms: c²W and αW at the points of every element (point,
     # element, point; rows y, columns x), applied matrix-free in rhs.jl, and the
-    # inverse of the pinned u-stiffness (mode, mode, element) ----
+    # inverse of the pinned u-stiffness, upper triangle packed by columns
+    # (entry (i, j), i ≤ j, in row j(j-1)/2 + i; element in the column) ----
     Cw    = zeros(qu1, N * N, qu1)
     Aw    = zeros(qu1, N * N, qu1)
-    Ainv_u = zeros(qu1^2, qu1^2, N * N)
+    nu2   = qu1^2
+    Ainv_u = zeros((nu2 * (nu2 + 1)) >> 1, N * N)
     for j in 1:N, k in 1:N
         # rows vary in y, columns in x
         Xq = repeat(xloc_all[k, :]', qu1, 1)
@@ -332,7 +430,11 @@ function precompute(q::Int, N::Int;
         # c²-stiffness with the constant mode pinned (elementwise mean condition)
         Mj = Phi_xi_u' * (cw .* Phi_xi_u) .+ Phi_eta_u' * (cw .* Phi_eta_u)
         Mj[1, 1] += 1.0
-        Ainv_u[:, :, j + (k - 1) * N] = inv(cholesky(Symmetric(Mj)))
+        Aj = inv(cholesky(Symmetric(Mj)))
+        e = j + (k - 1) * N
+        for jj in 1:nu2, ii in 1:jj
+            Ainv_u[((jj * (jj - 1)) >> 1) + ii, e] = Aj[ii, jj]
+        end
     end
 
     # ---- face coefficients (N×N×(q_u+1), one entry per face quadrature point) ----
@@ -588,12 +690,63 @@ function difference_norms(A, B)
     return (erru = s * sqrt(erru), errv = s * sqrt(errv), errE = s * sqrt(errE))
 end
 
+# C = A B for the small matrices of the energy diagnostics, summed as `*`
+# sums them: Julia's own formulas (no FMA) when C, A and B are all 2×2 or all
+# 3×3, otherwise as BLAS (`_mul_loops!`). Plain loops, because small BLAS
+# calls from parallel tasks are slower than the serial loop.
+function _mul_small!(C, A, B)
+    n = size(A, 1)
+    if (n == 2 || n == 3) && size(C) == size(A) == size(B) == (n, n)
+        @inbounds for j in 1:n, i in 1:n
+            s = A[i, 1] * B[1, j] + A[i, 2] * B[2, j]
+            n == 3 && (s = s + A[i, 3] * B[3, j])
+            C[i, j] = s
+        end
+        return C
+    end
+    return _mul_loops!(C, A, B)
+end
+
+# Element values of the energy diagnostics, and work arrays per block.
+function _diag_workspace(pre, N, ws)
+    nq = pre.qu1;  nu = pre.qu1;  nv = pre.qv1
+    (E = zeros(N * N), vmax = zeros(N * N), ndmin = zeros(N * N),
+     blk = [(U = zeros(nu, nu), V = zeros(nv, nv), Tu = zeros(nq, nu), Tv = zeros(nq, nv),
+             ux = zeros(nq, nq), uy = zeros(nq, nq), vh = zeros(nq, nq),
+             c2q = zeros(nq, nq), bq = zeros(nq, nq), Z = zeros(nq, nq)) for _ in 1:ws.nb])
+end
+
+# On every element: the Westervelt energy (h²/4) Σ W (½c²|∇u_h|² + (½ - ⅔βv_h)v_h²)
+# at the points, max|v_h| and min(1 - 2βv_h), on the blocks of ws in parallel;
+# bitwise the values of the serial expressions (h²/4) * sum(W2d .* (...)) with
+# ∇u_h = (2/h)(P_u U S_u', S_u U P_u') and v_h = P_v V P_v'.
+function _energy_diag!(dg, u, v, pre, geo, N, h, ws)
+    W2d = geo.W2d
+    _foreach_block(ws.nb) do b
+        B = dg.blk[b]
+        U = B.U;  V = B.V;  Tu = B.Tu;  Tv = B.Tv;  ux = B.ux;  uy = B.uy;  vh = B.vh
+        c2q = B.c2q;  bq = B.bq;  Z = B.Z
+        for e in ws.eblk[b]
+            j = (e - 1) % N + 1;  k = (e - 1) ÷ N + 1
+            U .= view(u, j, k, :, :);  V .= view(v, j, k, :, :)
+            _mul_small!(Tu, pre.P_u, U);  _mul_small!(ux, Tu, pre.S_uT);  ux .= (2/h) .* ux
+            _mul_small!(Tu, pre.S_u, U);  _mul_small!(uy, Tu, pre.P_uT);  uy .= (2/h) .* uy
+            _mul_small!(Tv, pre.P_v, V);  _mul_small!(vh, Tv, pre.P_vT)
+            c2q .= view(geo.err_c2, j, k, :, :);  bq .= view(geo.err_beta, j, k, :, :)
+            Z .= W2d .* (0.5 .* c2q .* (ux.^2 .+ uy.^2) .+ (0.5 .- (2/3) .* bq .* vh) .* vh.^2)
+            dg.E[e] = (h^2/4) * sum(Z)
+            Z .= abs.(vh);  dg.vmax[e] = maximum(Z)
+            Z .= 1 .- 2 .* bq .* vh;  dg.ndmin[e] = minimum(Z)
+        end
+    end
+    return nothing
+end
+
 # Source mode: RK4 with receiver time series, line slices, energy diagnostics
 # and full-field snapshots of v_h.
-function _run_source(u, v, dt, nsteps, N, h, pre, geo;
+function _run_source(u, v, dt, nsteps, N, h, pre, geo, ws;
                      record_every, slice_y, receivers, snap_times)
-    qu1 = pre.qu1;  qv1 = pre.qv1
-    P_u = pre.P_u;  P_v = pre.P_v;  S_u = geo.S_u;  W2d = geo.W2d
+    qu1 = pre.qu1;  qv1 = pre.qv1;  P_v = pre.P_v
     xloc_all = geo.xloc;  yloc_all = geo.yloc
     t = 0.0
 
@@ -613,16 +766,16 @@ function _run_source(u, v, dt, nsteps, N, h, pre, geo;
     end
     recvf(vv) = [(r[3] * vv[r[1], r[2], :, :] * r[4]')[1] for r in rcv]
 
-    # Westervelt energy ∫ ½c²|∇u|² + (½ - ⅔βv)v², max|v_h| and min(1 - 2βv_h)
+    # Westervelt energy ∫ ½c²|∇u|² + (½ - ⅔βv)v², max|v_h| and min(1 - 2βv_h):
+    # the values of the elements on the blocks of ws in parallel
+    # (`_energy_diag!`), then accumulated serially in the order row j, column k
+    dg = _diag_workspace(pre, N, ws)
     function diagf(uu, vv)
+        _energy_diag!(dg, uu, vv, pre, geo, N, h, ws)
         E = 0.0;  vmax = 0.0;  ndmin = Inf
         for j in 1:N, k in 1:N
-            ux = (2/h) .* (P_u * uu[j,k,:,:] * S_u');  uy = (2/h) .* (S_u * uu[j,k,:,:] * P_u')
-            vh = P_v * vv[j,k,:,:] * P_v'
-            c2q = geo.err_c2[j,k,:,:];  bq = geo.err_beta[j,k,:,:]
-            E += (h^2/4) * sum(W2d .* (0.5 .* c2q .* (ux.^2 .+ uy.^2)
-                                       .+ (0.5 .- (2/3) .* bq .* vh) .* vh.^2))
-            vmax  = max(vmax, maximum(abs.(vh)));  ndmin = min(ndmin, minimum(1 .- 2 .* bq .* vh))
+            e = j + (k - 1) * N
+            E += dg.E[e];  vmax = max(vmax, dg.vmax[e]);  ndmin = min(ndmin, dg.ndmin[e])
         end
         return E, vmax, ndmin
     end
@@ -636,11 +789,10 @@ function _run_source(u, v, dt, nsteps, N, h, pre, geo;
     rt_t  = Float64[];  rt_v = Vector{Float64}[]
     snaps = Tuple{Float64, Matrix{Float64}}[]
     snap_left = sort(collect(snap_times))
-    ws = Workspace(pre, N)
     for it in 1:nsteps
         rk4_step!(u, v, t, dt, N, h, pre, ws)
         t += dt
-        (all(isfinite, u) && all(isfinite, v)) || error("blow-up at t=$t")
+        all(ws.fin) || error("blow-up at t=$t")    # u, v finite (checked in `_rk4_final!`)
         push!(rt_t, t);  push!(rt_v, recvf(v))
         if it % record_every == 0 || it == nsteps
             E, vmax, ndmin = diagf(u, v)

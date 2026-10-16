@@ -16,14 +16,16 @@ with the weight `√(1 - 2βv)` (default), the same condition with the
 alternative weight `√(1 - βv)` (Remark 4.3 of the paper), a Dirichlet
 condition, or a reflecting wall (see *Boundary conditions* below).
 
-The right-hand side is evaluated for all elements at once: the traces on the
-element sides and the volume terms `(c²∇φ, ∇u_h)`, `(α∇φ, ∇v_h)` are obtained
-by a few large matrix products (sum factorization, without element
-matrices), every interior face is visited once, and all work arrays are
-preallocated. The element mass
+The right-hand side is evaluated for all elements at once: the volume terms
+`(c²∇φ, ∇u_h)`, `(α∇φ, ∇v_h)` are obtained by a few large matrix products
+(sum factorization, without element matrices), every interior face is
+visited once, and all work arrays are preallocated. The element mass
 systems with the solution-dependent weight `1 - 2βv_h` are solved
-matrix-free, by conjugate gradients element by element (default) or by
-Chebyshev iteration on all elements at once (`mass_solver = :chebyshev`).
+matrix-free, by Chebyshev iteration on all elements at once (default) or by
+conjugate gradients element by element (`mass_solver = :cg`). With Julia
+started on several threads, each evaluation on a large enough mesh runs in
+parallel on blocks of elements, with results identical to the serial run
+(see *Multithreading*).
 
 ## Installation
 
@@ -77,8 +79,10 @@ The main keywords of `solve` are:
 - `initial_profile`: in `:initial_value` mode, a NamedTuple of functions
   `(u0, u0_x, u0_y, u0_xx, u0_yy)` of `(x, y)` giving the initial displacement
   `u(0)` (default `Φ`).
-- `mass_solver`: `:cg` (default) or `:chebyshev`, the solver of the element
+- `mass_solver`: `:chebyshev` (default) or `:cg`, the solver of the element
   mass systems; both stop at the relative residual 1e-14.
+- `nblocks`: number of element blocks evaluated in parallel (default
+  `nothing`: chosen from the size of the problem, see *Multithreading*).
 
 For example, three reflecting walls and an absorbing bottom side, with a
 Gaussian source:
@@ -121,6 +125,15 @@ of the paper covers the two absorbing kinds (`:absorbing` through Remark 4.3);
 the convergence theorem for the nonlinear scheme (Theorem 4.2) assumes
 `-1 < sigma ≤ 1`.
 
+## Changes since 0.3.0
+
+- The default mass solver is now `:chebyshev` (it was `:cg`). Both solve
+  to the relative residual 1e-14, and the results differ at that level: the
+  errors of the regression tests, whose reference values in `data/` were
+  computed with `:cg`, agree to about 1e-11 relative.
+- Multithreaded evaluation with the keyword `nblocks` (see
+  *Multithreading*).
+
 ## Changes in 0.3.0
 
 - Boundary conditions per side: `:absorbing_2beta`, `:absorbing`,
@@ -140,8 +153,8 @@ the convergence theorem for the nonlinear scheme (Theorem 4.2) assumes
 | §5.1 convergence figure and table | `JOBS=8 bash experiments/convergence/run_all.sh` | `results/convergence/results.csv` | about 5 minutes with 8 processes (36 min on one core) |
 | | `python3 experiments/convergence/make_table.py` | `figures/convergence/conv_table.tex` | seconds |
 | | `python3 experiments/convergence/plot_panels.py` | `figures/convergence/*.pdf` | seconds |
-| §5.2 α → 0 table | `julia --project=. experiments/alpha_limit/run.jl` | `results/alpha_limit/order.csv` + printed table | about three minutes |
-| §5.3 steepening figure | `julia --project=. experiments/steepening/run.jl` | `results/steepening/<case>/` | about 20–25 minutes per case |
+| §5.2 α → 0 table | `julia --project=. -t 8 experiments/alpha_limit/run.jl` | `results/alpha_limit/order.csv` + printed table | about one minute with 8 threads (2–3 minutes on one) |
+| §5.3 steepening figure | `julia --project=. -t 8 experiments/steepening/run.jl` | `results/steepening/<case>/` | about 2.5 minutes per case with 8 threads (about 11 minutes on one; measured for `nl`) |
 | | `python3 experiments/steepening/plot.py` | `figures/steepening/*.pdf` | seconds |
 
 All experiments use `Δt = h/(10 q_u²)`, as stated in the paper. The
@@ -159,13 +172,68 @@ otherwise, so the paper's figures and tables can be rebuilt without rerunning
 the simulations. A subset of the convergence sweep can be run with, for
 example, `QS="1 2 3" bash experiments/convergence/run_all.sh`.
 
-Run the convergence cases as separate processes, as `run_all.sh` does, rather
-than as concurrent `Threads.@spawn` tasks inside one Julia session.
+Run parameter sweeps such as the convergence cases as separate
+single-threaded processes, as `run_all.sh` does, rather than as concurrent
+tasks inside one Julia session; the multithreading below is meant for a
+single long run.
+
+## Multithreading
+
+Start Julia with threads, for example `julia --project=. -t 8` (or set
+`JULIA_NUM_THREADS=8`). `solve` then splits the elements into contiguous
+blocks and evaluates every right-hand side in three parallel regions
+(element blocks, blocks of mesh columns for the faces, element blocks
+again), one task per block; the RK4 updates and, in `:source` mode, the
+energy diagnostics run on the same blocks. The keyword `nblocks` sets the
+number of blocks (at most `N²÷4`, so that a block has at least 4 elements),
+and `nblocks = 1` is the serial code. The default `nblocks = nothing`
+chooses from the work `N²(q_u+1)²`, because a parallel region costs a fixed
+few tens of microseconds of synchronization: below 5000 the serial code,
+below 20000 at most 4 blocks, above one block per Julia thread. For
+`q_u = 4` this is serial up to 14×14 elements and 4 blocks up to 28×28; for
+`q_u = 1` serial up to 35×35 and 4 blocks up to 70×70. The result does not
+depend on `nblocks` or on the number of Julia threads: the runs are
+identical bit for bit.
+Every block does the same operations on its elements, and the Chebyshev
+iteration takes the same number of steps on all elements. This relies on
+the BLAS computing each entry of a matrix product the same way whatever the
+size of the product, which the OpenBLAS shipped with Julia does (checked on
+Apple silicon); with another BLAS the runs may differ in the last bits.
+
+While more than one block is used, `solve`, `edg_rhs` and `rk4_step` set
+BLAS to one thread (each task makes its own BLAS calls) and restore the
+previous number when they return (after the last of several concurrent
+runs). The number of BLAS
+threads does not change the time stepping, but, as in earlier versions, it
+can change the last bits of the inverse element stiffness that `precompute`
+obtains from LAPACK; `solve` computes it with the session's number of BLAS
+threads. When calling `edg_rhs!` or `rk4_step!` directly with a workspace
+of more than one block (`ws.nb > 1`, which the default `Workspace(pre, N)`
+gives on large meshes when Julia has several threads), call
+`BLAS.set_num_threads(1)` (`using LinearAlgebra`) yourself.
+
+On an Apple M4 Pro (10 performance cores) with 8 threads, one right-hand
+side and one RK4 step take 6.3–6.8 times less time than with `nblocks = 1`,
+both with BLAS at one thread, for `q_u = 2, 4, 6` on meshes of 100×100 and
+150×150 elements, and about 6 times less on 64×64 for `q_u ≥ 3`. Against
+the serial code with the session's default BLAS threads (10 here), which
+makes the serial evaluation about 15% faster, the gain for `q_u = 4` on
+150×150 is about 5.5 for a right-hand side and 5 for an RK4 step. The
+u-equation reads one stored inverse per element (its upper triangle, the
+inverse being symmetric) and is limited by memory bandwidth, so it gains
+least. Small meshes gain less: the speedup is about
+3–5.5 on 32×32 for `q_u ≥ 3`. Whole runs: `solve(4, 32, 0.1)` takes 1.2 s
+instead of 3.4 s, and the `:source` run with `q_u = 4`, 64×64, `T = 0.05`
+2.5 s instead of 13 s. For sweeps, separate processes remain the most
+efficient. If processes and threads are combined, keep the number of
+processes times the threads per process at most the number of physical
+cores.
 
 ## Tests
 
 ```bash
 julia --project=. -e 'using Pkg; Pkg.test()'
+julia --project=. -e 'using Pkg; Pkg.test(julia_args = ["-t", "8"])'   # with 8 threads
 ```
 
 The suite takes about 2–3 minutes. The tests check:
@@ -185,6 +253,12 @@ The suite takes about 2–3 minutes. The tests check:
   boundary kind and a mixed configuration;
 - both mass solvers against a dense solve for `1 - 2βv_h` down to 0.1, and
   whole runs with `mass_solver = :cg` and `:chebyshev`;
+- that the right-hand side, RK4 steps and short runs are bitwise identical
+  for every number of blocks (`nblocks`), for both mass solvers, all modes,
+  every boundary kind and both degree pairings, that errors raised inside
+  the parallel regions keep their type and message, that arrays of
+  mismatched sizes are refused, and that the parallel energy diagnostics of
+  `:source` mode equal the serial expressions bit for bit;
 - that passing the default profile `Φ` as `initial_profile` reproduces the
   default `:initial_value` run.
 

@@ -1,7 +1,7 @@
 # Section 5.3, wave steepening (the steepening figure of the paper).
 #
-#   julia --project=. experiments/steepening/run.jl              # all three cases
-#   julia --project=. experiments/steepening/run.jl nl lin       # selected cases
+#   julia --project=. -t 8 experiments/steepening/run.jl         # all three cases
+#   julia --project=. -t 8 experiments/steepening/run.jl nl lin  # selected cases
 #
 # c = 1, α = 1e-6, zero initial data, Gaussian source at (0.15, 0.5) with
 # r0 = 0.05, ω0 = 16π, T_s = 1; upwind flux, q_u = 4, q_v = 3, N = 64, T = 1.8, σ = 0.
@@ -14,7 +14,8 @@
 #   series.csv  t, Westervelt energy, max|v_h|, min(1 - 2βv_h)
 #   grid.csv    x and y coordinates of the snapshot grid
 #   snap_<t>.csv  v_h on that grid at t ≈ 0.5, 0.8, 1.1
-# Cases run one after another; each takes about 20–25 minutes on one core.
+# Cases run one after another; the nl case takes about 2.5 minutes with 8
+# threads (-t 8) and about 11 minutes on one thread.
 using WesterveltEDG, Printf, DelimitedFiles
 
 const CASES = Dict("nl" => (8.0, :absorbing_2beta), "lin" => (0.0, :absorbing_2beta), "nl_dbc" => (8.0, :dirichlet))

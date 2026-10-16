@@ -1,6 +1,6 @@
 # Section 5.2, limiting behavior as α → 0 (the α-convergence table of the paper).
 #
-#   julia --project=. experiments/alpha_limit/run.jl
+#   julia --project=. -t 8 experiments/alpha_limit/run.jl
 #
 # Initial data u(0) = exp(1 - 1/(1 - |x - x0|²/R²)) for |x - x0| < R and 0
 # otherwise, x0 = (0.5, 0.5), R = 0.25 (smooth and zero near ∂Ω, so the data are
@@ -11,7 +11,7 @@
 # at t ≈ 0.25), Δt = h/(10 q_u²).
 # The solutions for α ∈ {1e-5, ..., 1e-9} are compared with the numerical
 # solution for α = 0 on the same mesh. Writes results/alpha_limit/order.csv.
-# Runtime: about three minutes.
+# Runtime: about one minute with 8 threads (-t 8), two to three minutes on one.
 using WesterveltEDG, Printf
 
 const X0 = (0.5, 0.5)

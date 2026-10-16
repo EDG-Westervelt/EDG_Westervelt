@@ -13,6 +13,9 @@ cd "$(dirname "$0")/../.."
 JOBS=${JOBS:-4}
 QS=${QS:-"6 5 4 3 2 1"}
 export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-2}
+# one Julia thread per process (the parallelism is across processes), also
+# when JULIA_NUM_THREADS is set in the calling shell
+export JULIA_NUM_THREADS=1
 D=results/convergence
 mkdir -p "$D/parts" "$D/logs"
 julia --project=. -e 'using Pkg; Pkg.instantiate(); using WesterveltEDG'
