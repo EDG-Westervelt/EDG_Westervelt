@@ -1,7 +1,13 @@
 # Reference implementation used by the tests: the element-by-element RHS of
 # WesterveltEDG.jl v0.1.0 (commit 4c9ec1d) with the dense LU mass solve,
-# kept verbatim except for the function names. The boundary kinds of v0.3.0
-# reach it through equivalent parameters (see `reference_pre` in runtests.jl).
+# kept verbatim except for the function names and the interior faces. The
+# interior faces use the one-sided coefficients of the two elements (own
+# values of c², α from pre.bot_c2, … and the neighbour's from the opposite
+# side of the neighbour), the mean penalty weight and the interface terms K
+# of u₀ and of the manufactured solution, as in (2.9) of the paper; for
+# coefficients that are continuous across the faces they reduce to the
+# formulas of v0.1.0. The boundary kinds of v0.3.0 reach it through
+# equivalent parameters (see `reference_pre` in runtests.jl).
 # The production RHS in src/rhs.jl must agree with it to rounding error.
 
 # Semi-discrete right-hand side of the EDG scheme for the Westervelt equation
@@ -66,6 +72,11 @@ function edg_rhs_reference(u::Array{Float64,4}, v::Array{Float64,4},
     # the u₀ terms of the ũ = u - u₀ change of variables.
     ct = pre.mms_on ? cos(omega * t) : 0.0
     st = pre.mms_on ? sin(omega * t) : 0.0
+    # interface term of the ũ = u - u₀ change of variables at an interior face
+    # from the one-sided c² and ∂_e u₀ of the "-" (m) and the "+" (p) element:
+    #     K = [[c²∇u₀]]
+    jump_terms(c2m, c2p, afm, afp, gm, gp) = c2m .* gm .- c2p .* gp
+    pen_w(c2m, c2p, afm, afp) = 0.5 .* (c2m .+ c2p) .* lambda_u .+ 0.5 .* (afm .+ afp) .* lambda_v
 
     ut = zeros(size(u))
     vt = zeros(size(v))
@@ -133,23 +144,24 @@ function edg_rhs_reference(u::Array{Float64,4}, v::Array{Float64,4},
             else
                 uout = u[j-1, k, :, :]
                 vout = v[j-1, k, :, :]
-                c2f = pre.bot_c2[j, k, :]
-                af  = pre.bot_af[j, k, :]
+                # this element is the "+" side of the face, (j-1, k) the "-" side
+                c2p = pre.bot_c2[j, k, :];    afp = pre.bot_af[j, k, :]
+                c2m = pre.top_c2[j-1, k, :];  afm = pre.top_af[j-1, k, :]
+                K   = jump_terms(c2m, c2p, afm, afp, pre.top_g0[j-1, k, :], pre.bot_g0[j, k, :])
 
                 v_jump_p = P_v * (Ebr_v * vout .- Ebl_v * vloc)'
-                jgu_p    = P_u * (two_h .* (E1br_u * uout .- E1bl_u * uloc))'
-                jgv_p    = P_v * (two_h .* (E1br_v * vout .- E1bl_v * vloc))'
-                gu_star_p = P_u * (theta .* E1bl_u * uloc .+ (1-theta) .* E1br_u * uout)'
-                gv_star_p = P_v * (theta .* E1bl_v * vloc .+ (1-theta) .* E1br_v * vout)'
+                gu_m = P_u * (E1br_u * uout)';  gu_p = P_u * (E1bl_u * uloc)'
+                gv_m = P_v * (E1br_v * vout)';  gv_p = P_v * (E1bl_v * vloc)'
+                jw   = two_h .* (c2m .* gu_m .- c2p .* gu_p .+ afm .* gv_m .- afp .* gv_p) .+ K
+                flux_p = theta .* (c2p .* gu_p .+ afp .* gv_p) .+ (1-theta) .* (c2m .* gu_m .+ afm .* gv_m)
 
-                dv_p   = theta .* v_jump_p .- tau .* (c2f .* jgu_p .+ af .* jgv_p)
-                flux_p = c2f .* gu_star_p .+ af .* gv_star_p
-                pen_p  = (c2f .* lambda_u .+ af .* lambda_v) .* v_jump_p
+                dv_p   = theta .* v_jump_p .- tau .* jw
+                pen_p  = pen_w(c2m, c2p, afm, afp) .* v_jump_p .- (1-theta) .* K
 
-                f = f .+ E1bl_u' * (P_u' * (w .* (c2f .* dv_p)))'
+                f = f .+ E1bl_u' * (P_u' * (w .* (c2p .* dv_p)))'
                 vt_rhs = vt_rhs .-
                          four_hh .* Ebl_v'  * (P_v' * (w .* flux_p))' .-
-                         four_hh .* E1bl_v' * (P_v' * (w .* (af .* dv_p)))' .+
+                         four_hh .* E1bl_v' * (P_v' * (w .* (afp .* dv_p)))' .+
                          two_h   .* Ebl_v'  * (P_v' * (w .* pen_p))'
             end
 
@@ -184,23 +196,24 @@ function edg_rhs_reference(u::Array{Float64,4}, v::Array{Float64,4},
             else
                 uout = u[j+1, k, :, :]
                 vout = v[j+1, k, :, :]
-                c2f = pre.top_c2[j, k, :]
-                af  = pre.top_af[j, k, :]
+                # this element is the "-" side of the face, (j+1, k) the "+" side
+                c2m = pre.top_c2[j, k, :];    afm = pre.top_af[j, k, :]
+                c2p = pre.bot_c2[j+1, k, :];  afp = pre.bot_af[j+1, k, :]
+                K   = jump_terms(c2m, c2p, afm, afp, pre.top_g0[j, k, :], pre.bot_g0[j+1, k, :])
 
                 v_jump_p = P_v * (Ebl_v * vout .- Ebr_v * vloc)'
-                jgu_p    = P_u * (two_h .* (.-E1bl_u * uout .+ E1br_u * uloc))'
-                jgv_p    = P_v * (two_h .* (.-E1bl_v * vout .+ E1br_v * vloc))'
-                gu_star_p = P_u * ((1-theta) .* E1br_u * uloc .+ theta .* E1bl_u * uout)'
-                gv_star_p = P_v * ((1-theta) .* E1br_v * vloc .+ theta .* E1bl_v * vout)'
+                gu_m = P_u * (E1br_u * uloc)';  gu_p = P_u * (E1bl_u * uout)'
+                gv_m = P_v * (E1br_v * vloc)';  gv_p = P_v * (E1bl_v * vout)'
+                jw   = two_h .* (c2m .* gu_m .- c2p .* gu_p .+ afm .* gv_m .- afp .* gv_p) .+ K
+                flux_p = (1-theta) .* (c2m .* gu_m .+ afm .* gv_m) .+ theta .* (c2p .* gu_p .+ afp .* gv_p)
 
-                dv_p   = (1-theta) .* v_jump_p .- tau .* (c2f .* jgu_p .+ af .* jgv_p)
-                flux_p = c2f .* gu_star_p .+ af .* gv_star_p
-                pen_p  = (c2f .* lambda_u .+ af .* lambda_v) .* v_jump_p
+                dv_p   = (1-theta) .* v_jump_p .- tau .* jw
+                pen_p  = pen_w(c2m, c2p, afm, afp) .* v_jump_p .- theta .* K
 
-                f = f .- E1br_u' * (P_u' * (w .* (c2f .* dv_p)))'
+                f = f .- E1br_u' * (P_u' * (w .* (c2m .* dv_p)))'
                 vt_rhs = vt_rhs .+
                          four_hh .* Ebr_v'  * (P_v' * (w .* flux_p))' .+
-                         four_hh .* E1br_v' * (P_v' * (w .* (af .* dv_p)))' .+
+                         four_hh .* E1br_v' * (P_v' * (w .* (afm .* dv_p)))' .+
                          two_h   .* Ebr_v'  * (P_v' * (w .* pen_p))'
             end
 
@@ -238,23 +251,24 @@ function edg_rhs_reference(u::Array{Float64,4}, v::Array{Float64,4},
             else
                 uout = u[j, k-1, :, :]'
                 vout = v[j, k-1, :, :]'
-                c2f = pre.lft_c2[j, k, :]
-                af  = pre.lft_af[j, k, :]
+                # this element is the "+" side of the face, (j, k-1) the "-" side
+                c2p = pre.lft_c2[j, k, :];    afp = pre.lft_af[j, k, :]
+                c2m = pre.rgt_c2[j, k-1, :];  afm = pre.rgt_af[j, k-1, :]
+                K   = jump_terms(c2m, c2p, afm, afp, pre.rgt_g0[j, k-1, :], pre.lft_g0[j, k, :])
 
                 v_jump_p = P_v * (Ebr_v * vout .- Ebl_v * vloc')'
-                jgu_p    = P_u * (two_h .* (E1br_u * uout .- E1bl_u * uloc'))'
-                jgv_p    = P_v * (two_h .* (E1br_v * vout .- E1bl_v * vloc'))'
-                gu_star_p = P_u * (theta .* E1bl_u * uloc' .+ (1-theta) .* E1br_u * uout)'
-                gv_star_p = P_v * (theta .* E1bl_v * vloc' .+ (1-theta) .* E1br_v * vout)'
+                gu_m = P_u * (E1br_u * uout)';  gu_p = P_u * (E1bl_u * uloc')'
+                gv_m = P_v * (E1br_v * vout)';  gv_p = P_v * (E1bl_v * vloc')'
+                jw   = two_h .* (c2m .* gu_m .- c2p .* gu_p .+ afm .* gv_m .- afp .* gv_p) .+ K
+                flux_p = theta .* (c2p .* gu_p .+ afp .* gv_p) .+ (1-theta) .* (c2m .* gu_m .+ afm .* gv_m)
 
-                dv_p   = theta .* v_jump_p .- tau .* (c2f .* jgu_p .+ af .* jgv_p)
-                flux_p = c2f .* gu_star_p .+ af .* gv_star_p
-                pen_p  = (c2f .* lambda_u .+ af .* lambda_v) .* v_jump_p
+                dv_p   = theta .* v_jump_p .- tau .* jw
+                pen_p  = pen_w(c2m, c2p, afm, afp) .* v_jump_p .- (1-theta) .* K
 
-                f      = f      .+ (P_u' * (w .* (c2f .* dv_p))) * E1bl_u
+                f      = f      .+ (P_u' * (w .* (c2p .* dv_p))) * E1bl_u
                 vt_rhs = vt_rhs .-
                          four_hh .* (P_v' * (w .* flux_p)) * Ebl_v .-
-                         four_hh .* (P_v' * (w .* (af .* dv_p))) * E1bl_v .+
+                         four_hh .* (P_v' * (w .* (afp .* dv_p))) * E1bl_v .+
                          two_h   .* (P_v' * (w .* pen_p)) * Ebl_v
             end
 
@@ -292,23 +306,24 @@ function edg_rhs_reference(u::Array{Float64,4}, v::Array{Float64,4},
             else
                 uout = u[j, k+1, :, :]'
                 vout = v[j, k+1, :, :]'
-                c2f = pre.rgt_c2[j, k, :]
-                af  = pre.rgt_af[j, k, :]
+                # this element is the "-" side of the face, (j, k+1) the "+" side
+                c2m = pre.rgt_c2[j, k, :];    afm = pre.rgt_af[j, k, :]
+                c2p = pre.lft_c2[j, k+1, :];  afp = pre.lft_af[j, k+1, :]
+                K   = jump_terms(c2m, c2p, afm, afp, pre.rgt_g0[j, k, :], pre.lft_g0[j, k+1, :])
 
                 v_jump_p = P_v * (Ebl_v * vout .- Ebr_v * vloc')'
-                jgu_p    = P_u * (two_h .* (.-E1bl_u * uout .+ E1br_u * uloc'))'
-                jgv_p    = P_v * (two_h .* (.-E1bl_v * vout .+ E1br_v * vloc'))'
-                gu_star_p = P_u * ((1-theta) .* E1br_u * uloc' .+ theta .* E1bl_u * uout)'
-                gv_star_p = P_v * ((1-theta) .* E1br_v * vloc' .+ theta .* E1bl_v * vout)'
+                gu_m = P_u * (E1br_u * uloc')';  gu_p = P_u * (E1bl_u * uout)'
+                gv_m = P_v * (E1br_v * vloc')';  gv_p = P_v * (E1bl_v * vout)'
+                jw   = two_h .* (c2m .* gu_m .- c2p .* gu_p .+ afm .* gv_m .- afp .* gv_p) .+ K
+                flux_p = (1-theta) .* (c2m .* gu_m .+ afm .* gv_m) .+ theta .* (c2p .* gu_p .+ afp .* gv_p)
 
-                dv_p   = (1-theta) .* v_jump_p .- tau .* (c2f .* jgu_p .+ af .* jgv_p)
-                flux_p = c2f .* gu_star_p .+ af .* gv_star_p
-                pen_p  = (c2f .* lambda_u .+ af .* lambda_v) .* v_jump_p
+                dv_p   = (1-theta) .* v_jump_p .- tau .* jw
+                pen_p  = pen_w(c2m, c2p, afm, afp) .* v_jump_p .- theta .* K
 
-                f      = f      .- (P_u' * (w .* (c2f .* dv_p))) * E1br_u
+                f      = f      .- (P_u' * (w .* (c2m .* dv_p))) * E1br_u
                 vt_rhs = vt_rhs .+
                          four_hh .* (P_v' * (w .* flux_p)) * Ebr_v .+
-                         four_hh .* (P_v' * (w .* (af .* dv_p))) * E1br_v .+
+                         four_hh .* (P_v' * (w .* (afm .* dv_p))) * E1br_v .+
                          two_h   .* (P_v' * (w .* pen_p)) * Ebr_v
             end
 

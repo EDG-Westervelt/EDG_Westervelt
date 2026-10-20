@@ -74,8 +74,11 @@ The main keywords of `solve` are:
 - `sigma`, `sigma_dirichlet`, `kappa`: parameters of the absorbing,
   Dirichlet and wall fluxes.
 - `coefficients`: see `paper_coefficients`, `constant_coefficients` and
-  `replace_coefficients`.
-- `dt_fac`: the time step is `Δt ≈ h/(dt_fac q_u²)`.
+  `replace_coefficients`; they may jump across mesh lines (see
+  *Coefficients*).
+- `dt_fac`: the time step is `Δt ≈ h/(dt_fac q_u²)`; it does not scale with
+  `c` or `α`, so raise `dt_fac` for faster or more viscous media (see
+  *Coefficients*).
 - `initial_profile`: in `:initial_value` mode, a NamedTuple of functions
   `(u0, u0_x, u0_y, u0_xx, u0_yy)` of `(x, y)` giving the initial displacement
   `u(0)` (default `Φ`).
@@ -125,8 +128,93 @@ of the paper covers the two absorbing kinds (`:absorbing` through Remark 4.3);
 the convergence theorem for the nonlinear scheme (Theorem 4.2) assumes
 `-1 < sigma ≤ 1`.
 
+## Coefficients
+
+`coefficients` is a `Coefficients(c, c_x, c_y, alpha, alpha_x, alpha_y, beta)`
+of functions of `(x, y)`. `paper_coefficients()` gives those of Section 5.1,
+and `constant_coefficients` and `replace_coefficients` build constant ones.
+The derivatives of `c` and `α` are only used by the manufactured source of
+`:mms` mode and by `∇·(c²∇u₀)` in `:initial_value` mode.
+
+### Piecewise-continuous coefficients
+
+`c`, `α` and `β` may jump across mesh lines `x = k/N` or `y = j/N`, as the
+paper allows (`c`, `α` piecewise `W^{1,∞}` and `β` piecewise continuous on a
+partition resolved by the mesh). For example, a two-layer medium with the
+interface `x = 1/2` (a mesh line for even `N`):
+
+```julia
+cs(x, y) = x < 0.5 ? 1.0 : 0.5
+z(x, y) = 0.0
+co = Coefficients(cs, z, z, (x, y) -> 1e-6 * cs(x, y)^2, z, z, (x, y) -> x < 0.5 ? 0.0 : 4.0)
+H = solve(3, 32, 1.0; mode = :source, coefficients = co, boundary = :wall)
+```
+
+- **Fluxes.** On an interior face, each element uses the coefficients on
+  its own side in all face terms: the fluxes (2.9) of the paper with the
+  one-sided values `c₁², c₂², α₁, α₂` in the averages, in the jump
+  `[[c²∇u]] + [[α∇v]]` of `v*`, and in the terms `c²∇φ_u·n (v* - v)` and
+  `α∇φ_v·n (v* - v)` of each element. The penalty weight is the mean
+  `½(c₁² + c₂²) λ_u + ½(α₁ + α₂) λ_v`. The discrete energy identity (2.10)
+  holds, so the scheme is conservative for central and alternating fluxes
+  and dissipative for the others, as for continuous coefficients.
+- **One-sided values.** The function is evaluated at the face quadrature
+  points shifted by `δ = 2⁻⁴⁰ ≈ 9·10⁻¹³` into each element (on the physical
+  boundary: into the domain). Where both shifted values agree with the value
+  at the point itself to the relative tolerance `10⁻⁸` (plus `10⁻⁸` times
+  the largest shifted value, for pieces where `α` or `β` is 0), the point
+  value is used on both sides. Therefore:
+  - continuous coefficients give the same numbers as before, bit for bit
+    (the paper's runs and `data/` are unchanged);
+  - the value a function returns on the interface itself does not matter:
+    `x < 0.5` and `x <= 0.5` give the same result, and so does any other
+    value there (also `Inf` or `NaN`);
+  - an interface given as a decimal is found although the mesh line is
+    computed in floating point (`x < 0.3` with `N = 10`, whose mesh line is
+    `3·0.1 = 0.30000000000000004`);
+  - a jump below about `10⁻⁸` relative counts as continuous; a smooth
+    coefficient whose normal derivative exceeds about `10⁴` times its
+    maximum takes the shifted values, with an error of the order of `δ|∇f|`.
+
+  `pre.one_sided` (from `precompute`) tells whether some interior face has
+  different values of `c²` or `α` on its two sides, or nonzero interface
+  terms of `u₀` (see *Modes*); a jump of `β`
+  alone does not count, since `β` enters only the volume and boundary terms.
+  The right-hand side then uses the one-sided face kernel on all faces
+  (measured: no slower than the kernel with one value per face point).
+- **Modes.**
+  - `:source`: no further condition.
+  - `:initial_value`: the change of variables `ũ = u - u₀` contributes the
+    interface terms `[[c²∇u₀]]` to the face fluxes, so `u₀` may have kinks on
+    mesh lines and `c` may jump where `∂_n u₀ ≠ 0`. Inside the elements `u₀`
+    must be smooth.
+  - `:mms`: `c` and `α` must be continuous across the element faces (`β`
+    may jump); `precompute` raises an error otherwise, since the smooth
+    `Φ` does not satisfy the transmission conditions at a jump of `c` or
+    `α`. Use `:initial_value` or `:source` for coefficients that jump.
+- **Time step.** `Δt = h/(dt_fac q_u²)` does not scale with the
+  coefficients; the default `dt_fac = 10` suits the paper's `c ≈ 1` and
+  small `α`. For faster pieces, raise `dt_fac` roughly in proportion to
+  `max c`, and further for large `α` (the term `∇·(α∇v)` limits `Δt` like
+  `h²/α`, so more on finer meshes). For example, with `q_u = q_v = 2`,
+  upwind fluxes and `N = 32`, `c = 2` needs `dt_fac = 20`, and so does
+  `c = 1` with `α = 10⁻²`. The default is kept, so that the paper's runs are
+  unchanged.
+- **Not supported.** Jumps that cut through elements (off the mesh lines)
+  are not detected. The scheme stays stable, since `c² > 0` at the
+  quadrature points, but the accuracy drops to that of a non-smooth solution
+  and depends on where the quadrature points fall. Interfaces must be mesh
+  lines of the uniform Cartesian mesh.
+
 ## Changes since 0.3.0
 
+- Piecewise-continuous `c`, `α`, `β` with jumps on mesh lines (one-sided face
+  coefficients, see *Coefficients*). Before, both elements at a face used
+  the single point value of `c²` and `α`; with a jump in `c` or `α` this was
+  stable but in general not consistent (for the exact standing mode of a
+  two-layer medium, the errors of the upwind and central fluxes did not
+  decrease with `h`). Results for continuous coefficients are unchanged bit
+  for bit.
 - The default mass solver is now `:chebyshev` (it was `:cg`). Both solve
   to the relative residual 1e-14, and the results differ at that level: the
   errors of the regression tests, whose reference values in `data/` were
@@ -236,14 +324,15 @@ julia --project=. -e 'using Pkg; Pkg.test()'
 julia --project=. -e 'using Pkg; Pkg.test(julia_args = ["-t", "8"])'   # with 8 threads
 ```
 
-The suite takes about 2–3 minutes. The tests check:
+The suite takes about 3–4 minutes. The tests check:
 
 - the quadrature;
 - that the zero initial state solves the initialization system for the
   manufactured solution;
 - that the right-hand side agrees with the element-by-element implementation
-  of v0.1.0 (`test/reference_rhs.jl`, dense LU mass solve) for random states,
-  all fluxes, both degree pairings, all modes and every boundary kind;
+  of v0.1.0 (`test/reference_rhs.jl`, dense LU mass solve, with the interior
+  faces written for one-sided coefficients) for random states, all fluxes,
+  both degree pairings, all modes and every boundary kind;
 - regression against `data/convergence/results.csv` and, for `:absorbing`,
   against the data of v0.2.0;
 - the boundary fluxes pointwise (consistency and the sign of the boundary
@@ -260,7 +349,21 @@ The suite takes about 2–3 minutes. The tests check:
   mismatched sizes are refused, and that the parallel energy diagnostics of
   `:source` mode equal the serial expressions bit for bit;
 - that passing the default profile `Φ` as `initial_profile` reproduces the
-  default `:initial_value` run.
+  default `:initial_value` run;
+- for piecewise coefficients: the one-sided face values (the point values,
+  bit for bit, for continuous coefficients; the values of the pieces for
+  different definitions of a jump, also with a huge, `Inf` or `NaN` value on
+  another interface line; boundary values from inside), the reduction of the
+  one-sided kernel to the plain one, the right-hand side against the
+  reference with one-sided faces in all modes, the exact time derivatives of
+  piecewise-quadratic states that satisfy the transmission conditions at a
+  jump of `c` and `α` (no reference implementation involved), the
+  semi-discrete energy identity (2.10) with one-sided coefficients to
+  round-off for random states, the interface terms of `u₀` (the
+  `:initial_value` right-hand side at `ũ = 0` equals the plain one at
+  `u = u₀` for `u₀ ∈ U_h`), the convergence order for an exact two-layer
+  standing mode, that `:mms` refuses jumps of `c` and `α`, the energy
+  decay with absorbing sides, and the multithreading tests above with jumps.
 
 ## Layout
 
@@ -274,6 +377,7 @@ src/
 experiments/         drivers and figure scripts for Sections 5.1–5.3
 data/                reference results used in the paper
 test/                test suite; reference_rhs.jl is the v0.1.0 right-hand side
+                     (interior faces with one-sided coefficients)
 results/, figures/   written by the drivers and figure scripts (not tracked)
 ```
 

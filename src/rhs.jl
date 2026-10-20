@@ -11,9 +11,13 @@
 # values at the tensor Gauss points are P U P'.
 #
 # The displacement is advanced as ũ = u - u₀ with u₀ the initial profile
-# (see `solve`), which only adds the known terms ∇·(c²∇u₀) to the source and
+# (see `solve`), which only adds the known terms ∇·(c²∇u₀) to the source,
 # -(c²∇u₀)·n to the boundary data of the flux c²∇u·n (absorbing and wall
-# sides).
+# sides) and, where c²∇u₀·n jumps across an interior face, the jump
+# [[c²∇u₀]] to the face terms (`_interior_faces_os!`).
+#
+# The coefficients may jump across mesh faces: on a face every element uses
+# its own values of c², α (and β on the boundary), precomputed in solver.jl.
 #
 # Structure of one evaluation (all arrays are preallocated in a `Workspace`):
 #   1. copy u, v to element-last arrays U[:, :, j, k] (and their transposes);
@@ -578,8 +582,23 @@ end
 # Interior faces in the mesh columns kr: s = v^- - v^+ is the jump seen from
 # the element on the "+" side (above, resp. to the right);
 # g* = θ ∂_n w^+ + (1-θ) ∂_n w^- (reference scaling), jg = (2/h)(∂ w^- - ∂ w^+).
+# With one value of c² and α per face point (continuous coefficients) the
+# faces are `_interior_faces!`; when some face has different coefficients on
+# its two sides, or interface terms of u₀ (pre.one_sided), all faces are
+# `_interior_faces_os!`.
 function _faces!(ws, pre, two_h, N, kr)
     theta = pre.theta;  tau = pre.tau;  lu = pre.lambda_u;  lv = pre.lambda_v
+    if pre.one_sided
+        _interior_faces_os!(ws.AB, ws.DB, ws.FB, ws.AT, ws.DT, ws.FT,
+                            ws.vT, ws.vB, ws.duT, ws.duB, ws.dvT, ws.dvB,
+                            pre.hc2m, pre.hc2, pre.hafm, pre.haf, pre.hJC,
+                            theta, tau, lu, lv, two_h, N, kr, Val(:horizontal))
+        _interior_faces_os!(ws.AL, ws.DL, ws.FL, ws.AR, ws.DR, ws.FR,
+                            ws.vR, ws.vL, ws.duR, ws.duL, ws.dvR, ws.dvL,
+                            pre.vc2m, pre.vc2, pre.vafm, pre.vaf, pre.vJC,
+                            theta, tau, lu, lv, two_h, N, kr, Val(:vertical))
+        return nothing
+    end
     _interior_faces!(ws.AB, ws.DB, ws.FB, ws.AT, ws.DT, ws.FT,
                      ws.vT, ws.vB, ws.duT, ws.duB, ws.dvT, ws.dvB,
                      pre.hc2, pre.haf, theta, tau, lu, lv, two_h, N, kr, Val(:horizontal))
@@ -595,7 +614,9 @@ end
 # "+" element, column); for vertical faces over (point, row, column of the "+"
 # element). Writes the A, D, F arrays of the "+" element's B/L side and of the
 # "-" element's T/R side (for vertical faces the "-" element is in the column
-# before; no other column range writes that slot).
+# before; no other column range writes that slot). Both elements use the one
+# value c2f, aff of c² and α at a face point, which is the paper's scheme for
+# coefficients that are continuous across the face.
 function _interior_faces!(Ap, Dp, Fp, Am, Dm, Fm, vM, vP, duM, duP, dvM, dvP,
                           c2f, aff, theta, tau, lu, lv, two_h, N, kr, ::Val{orient}) where {orient}
     N < 2 && return nothing
@@ -621,6 +642,59 @@ function _interior_faces!(Ap, Dp, Fp, Am, Dm, Fm, vM, vP, duM, duP, dvM, dvP,
                       (c2 * lu + af * lv) * (vm - vp)
         @. Dm[M...] =  af * ((1 - theta) * (vp - vm) - tau * (c2 * (two_h * (dum - dup)) + af * (two_h * (dvm - dvp))))
         @. Fm[M...] = -c2 * ((1 - theta) * (vp - vm) - tau * (c2 * (two_h * (dum - dup)) + af * (two_h * (dvm - dvp))))
+    end
+    return nothing
+end
+
+# The same faces with one-sided coefficients: c²₋, α₋ of the "-" element
+# (c2m, afm) and c²₊, α₊ of the "+" element (c2p, afp), the fluxes (2.9) of
+# the paper with the paper's element 1 = "-" (n₁ = e) and element 2 = "+".
+# With s = v⁻ - v⁺, the reference-scaled derivatives ∂ along e and
+#     J = [[c²∇u]] + [[α∇v]] + K = (2/h)(c²₋ ∂u⁻ - c²₊ ∂u⁺ + α₋ ∂v⁻ - α₊ ∂v⁺) + K,
+#     G = {{c²∇u + α∇v}}_{1-θ}·e = (2/h)((1-θ)(c²₋ ∂u⁻ + α₋ ∂v⁻) + θ(c²₊ ∂u⁺ + α₊ ∂v⁺)),
+# the trace is v* = θ v⁻ + (1-θ) v⁺ - τ J and the penalty weight the mean
+# ½(c²₋ + c²₊) λ_u + ½(α₋ + α₊) λ_v (the values of `_interior_faces!` for
+# continuous coefficients). K = JC = [[c²∇u₀]] is the known interface term of
+# the ũ = u - u₀ change of variables; it adds -θK to the flux of the "-"
+# element and -(1-θ)K to that of the "+" element and vanishes where c²∇u₀ is
+# continuous. The lifted terms c²∇φ_u·n (v* - v) and α∇φ_v·n (v* - v) of each
+# element use its own coefficients, which the energy identity (2.10) pairs
+# with its own fluxes.
+function _interior_faces_os!(Ap, Dp, Fp, Am, Dm, Fm, vM, vP, duM, duP, dvM, dvP,
+                             c2mf, c2pf, afmf, afpf, jcf,
+                             theta, tau, lu, lv, two_h, N, kr, ::Val{orient}) where {orient}
+    N < 2 && return nothing
+    nq = size(Ap, 1)
+    # "+" element (i, j, k) and face (i, j, k); "-" element (i, j - dj, k - dk)
+    if orient === :horizontal
+        rows = 2:N;  cols = kr;  dj = 1;  dk = 0
+    else
+        rows = 1:N;  cols = max(first(kr), 2):last(kr);  dj = 0;  dk = 1
+    end
+    @inbounds for k in cols, j in rows
+        jm = j - dj;  km = k - dk
+        for i in 1:nq
+            vm = vM[i, jm, km];    vp = vP[i, j, k]
+            dum = duM[i, jm, km];  dup = duP[i, j, k]
+            dvm = dvM[i, jm, km];  dvp = dvP[i, j, k]
+            c2m = c2mf[i, j, k];   c2p = c2pf[i, j, k]
+            afm = afmf[i, j, k];   afp = afpf[i, j, k]
+            K   = jcf[i, j, k]
+            J   = two_h * (c2m * dum - c2p * dup + afm * dvm - afp * dvp) + K
+            G   = two_h * ((1 - theta) * (c2m * dum + afm * dvm) + theta * (c2p * dup + afp * dvp))
+            pen = (0.5 * (c2m + c2p)) * lu + (0.5 * (afm + afp)) * lv
+            s   = vm - vp
+            dvsp = theta * s - tau * J                  # v* - v⁺
+            dvsm = (1 - theta) * (vp - vm) - tau * J    # v* - v⁻
+            # "+" element (bottom / left side of its own)
+            Ap[i, j, k] = pen * s - G - (1 - theta) * K
+            Dp[i, j, k] = -afp * dvsp
+            Fp[i, j, k] =  c2p * dvsp
+            # "-" element (top / right side of its own)
+            Am[i, jm, km] = G - pen * s - theta * K
+            Dm[i, jm, km] =  afm * dvsm
+            Fm[i, jm, km] = -c2m * dvsm
+        end
     end
     return nothing
 end

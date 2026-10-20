@@ -123,9 +123,11 @@ degree `q_u` for `u_h` and `q_v = q_u - 1` (`mixed = true`) or `q_v = q_u`
 - `initial_profile = nothing`: in `:initial_value` mode, a NamedTuple of
   functions `(u0, u0_x, u0_y, u0_xx, u0_yy)` of `(x, y)` that replaces `Φ` as
   the initial displacement `u(0)` (with `u_t(0) = 0`).
-- `coefficients = paper_coefficients()`: see [`Coefficients`](@ref).
+- `coefficients = paper_coefficients()`: see [`Coefficients`](@ref); they
+  may jump across mesh lines (see *Piecewise-continuous coefficients* below).
 - `kx = 1, ky = 1`: wave numbers of Φ.
-- `dt_fac = 10`.
+- `dt_fac = 10`: the time step does not scale with `c` or `α`; raise
+  `dt_fac` roughly in proportion to `max c`, and further for large `α`.
 - `mass_solver = :chebyshev`: solver of the element mass systems,
   `:chebyshev` (Chebyshev iteration on all elements at once) or `:cg`
   (conjugate gradients, element by element); both to the relative residual
@@ -145,6 +147,22 @@ degree `q_u` for `u_h` and `q_v = q_u - 1` (`mixed = true`) or `q_v = q_u`
 The displacement is integrated as `ũ = u - Φ` with `ũ(0) = 0`, `v(0) = 0`; for
 the manufactured solution this zero state solves the nonlinear
 initialization system of the paper exactly (see `test/runtests.jl`).
+
+# Piecewise-continuous coefficients
+`c`, `α` and `β` may jump across mesh lines (see [`Coefficients`](@ref)); on
+the faces each element then uses its own values, as in the fluxes (2.9) of
+the paper, with the penalty weight `½(c²₁ + c²₂) λ_u + ½(α₁ + α₂) λ_v` on a
+face between elements 1 and 2. The modes treat the jumps as follows.
+- `:source`: no further condition.
+- `:initial_value`: the change of variables `ũ = u - u₀` includes the
+  interface terms `[[c²∇u₀]]` on the faces, so that the run is the scheme
+  for `u` with `u_h(0) = u₀` also where `c²∂_n u₀` jumps: `u₀` may have
+  kinks on mesh lines, and `c` may jump where `∂_n u₀ ≠ 0`. Inside the
+  elements `u₀` must be smooth (`u0_xx`, `u0_yy` are only evaluated there).
+- `:mms`: `c` and `α` must be continuous across the element faces (`β` may
+  jump); `precompute` raises an error otherwise, since the smooth `Φ` does
+  not satisfy the transmission conditions at a jump of `c` or `α`.
+Jumps inside elements (off the mesh lines) are not supported.
 """
 function solve(q::Int, N::Int, T::Float64;
                mixed::Bool = true,
@@ -320,12 +338,92 @@ function rk4_step(u, v, t, dt, N, h, pre; nblocks::Union{Nothing,Integer} = noth
     end
 end
 
+# One-sided values on the faces. The coefficients may jump across mesh faces
+# (piecewise-continuous c, α, β whose discontinuities lie on mesh lines); at a
+# face point x_f between the element on the "-" side (below / to the left) and
+# the one on the "+" side (above / to the right), with e the unit vector from
+# "-" to "+", each element needs the limit of the coefficient from inside it.
+# A user function returns a single value at x_f, which may belong to either
+# piece (`x < 0.5`, `x <= 0.5`) or to neither, so the limits are taken as
+# f(x_f - δe) and f(x_f + δe) with δ = _FACE_SHIFT, unless f(x_f) is finite
+# and both agree with it to the tolerance |a - b| ≤ _JUMP_TOL (max(|a|, |b|) +
+# max|f|); then both sides take f(x_f), so that a continuous coefficient keeps
+# the values of the plain point evaluation bit for bit. max|f| is taken over
+# the finite shifted values only, so that the value on an interface line
+# itself, which may be anything (also huge, Inf or NaN), hides no jump on
+# another line.
+# δ = 2⁻⁴⁰ ≈ 9.1e-13 is about 4000 ulp of the coordinates, which puts the
+# shifted points on the correct side of an interface given as a decimal
+# (`x < 0.3` against the mesh line 3·0.1 = 0.30000000000000004), and far below
+# any mesh size. A smooth f is taken as continuous as long as
+# δ|∂_n f| ≤ _JUMP_TOL max|f| roughly, i.e. |∂_n f| up to about 10⁴ max|f|;
+# a steeper f takes the shifted values, whose error is of the order δ|∇f|.
+const _FACE_SHIFT = 2.0^-40
+const _JUMP_TOL = 1e-8
+
+# One-sided values of f on the sides of every element: bot[j, k, i] is the
+# value at point i of the bottom side of element (j, k) seen from inside that
+# element, likewise top, lft and rgt (arrays N×N×(q_u+1)). A point on the
+# physical boundary uses f(x_f + δn) for the inward normal n in the same way,
+# so that a definition that leaves out the boundary line (`0 < x < 0.5`)
+# gives the value inside. bot, top or lft, rgt may be `nothing` to skip the
+# horizontal or the vertical faces.
+function _side_values!(bot, top, lft, rgt, f, xloc, yloc, N, h)
+    nq = size(xloc, 2);  δ = _FACE_SHIFT
+    hz = bot !== nothing;  vt = lft !== nothing
+    # f at the points of the horizontal faces y = (jf-1)h and of the vertical
+    # faces x = (kf-1)h, face rows / columns jf, kf = 1..N+1 (H0, V0), and at
+    # these points shifted by -δe (HM, VM) and by +δe (HP, VP); on the physical
+    # boundary the shift out of the domain is not evaluated and repeats f(x_f)
+    H0 = hz ? [f(xloc[k, i], (jf - 1) * h) for i in 1:nq, jf in 1:N+1, k in 1:N] : zeros(0, 0, 0)
+    HM = hz ? [jf > 1  ? f(xloc[k, i], (jf - 1) * h - δ) : H0[i, jf, k] for i in 1:nq, jf in 1:N+1, k in 1:N] : H0
+    HP = hz ? [jf <= N ? f(xloc[k, i], (jf - 1) * h + δ) : H0[i, jf, k] for i in 1:nq, jf in 1:N+1, k in 1:N] : H0
+    V0 = vt ? [f((kf - 1) * h, yloc[j, i]) for i in 1:nq, j in 1:N, kf in 1:N+1] : zeros(0, 0, 0)
+    VM = vt ? [kf > 1  ? f((kf - 1) * h - δ, yloc[j, i]) : V0[i, j, kf] for i in 1:nq, j in 1:N, kf in 1:N+1] : V0
+    VP = vt ? [kf <= N ? f((kf - 1) * h + δ, yloc[j, i]) : V0[i, j, kf] for i in 1:nq, j in 1:N, kf in 1:N+1] : V0
+    # absolute part of the tolerance from the finite shifted values only
+    amax(A) = maximum(a -> isfinite(a) ? abs(a) : 0.0, A; init = 0.0)
+    sh = hz ? max(amax(view(HM, :, 2:N+1, :)), amax(view(HP, :, 1:N, :))) : 0.0
+    sv = vt ? max(amax(view(VM, :, :, 2:N+1)), amax(view(VP, :, :, 1:N))) : 0.0
+    s = _JUMP_TOL * max(sh, sv)
+    near(a, b) = abs(a - b) <= _JUMP_TOL * max(abs(a), abs(b)) + s
+    # the values seen from the "-" and the "+" side of a face point with
+    # f(x_f) = f0 and the shifted values fm, fp
+    sides(f0, fm, fp) = isfinite(f0) && near(fm, f0) && near(fp, f0) ? (f0, f0) : (fm, fp)
+    if hz
+        for k in 1:N, jf in 1:N+1, i in 1:nq
+            fm, fp = sides(H0[i, jf, k], HM[i, jf, k], HP[i, jf, k])
+            jf > 1  && (top[jf - 1, k, i] = fm)
+            jf <= N && (bot[jf, k, i] = fp)
+        end
+    end
+    if vt
+        for kf in 1:N+1, j in 1:N, i in 1:nq
+            fm, fp = sides(V0[i, j, kf], VM[i, j, kf], VP[i, j, kf])
+            kf > 1  && (rgt[j, kf - 1, i] = fm)
+            kf <= N && (lft[j, kf, i] = fp)
+        end
+    end
+    return nothing
+end
+
 """
     precompute(q_u, N; kwargs...) -> (pre, geo)
 
 Build all element operators, face coefficients and data arrays used by
 [`edg_rhs`](@ref) (`pre`), plus the quadrature geometry used for error
 evaluation and diagnostics (`geo`). Keywords as in [`solve`](@ref).
+
+On the faces, every element uses the values of c, α and β seen from inside
+it, so that coefficients may jump across mesh faces (see
+[`Coefficients`](@ref)). `pre.one_sided` tells whether some interior face
+has different values of c² or α on its two sides, or nonzero interface terms
+of u₀ (see [`solve`](@ref)); in `:mms` mode a jump of c or α is an error. A
+jump of β
+alone does not count, since β enters only the volume and boundary terms. The
+right-hand side then uses the face kernel with one-sided coefficients, and
+otherwise the kernel with one value per face point, which gives the same
+numbers as before for continuous coefficients.
 """
 function precompute(q::Int, N::Int;
                     mixed::Bool = true, flux::Symbol = :upwind, flux_params = nothing,
@@ -437,23 +535,36 @@ function precompute(q::Int, N::Int;
         end
     end
 
-    # ---- face coefficients (N×N×(q_u+1), one entry per face quadrature point) ----
+    # ---- face coefficients (N×N×(q_u+1), one entry per face quadrature point):
+    # the values on the sides of every element seen from inside it
+    # (`_side_values!`; the point values where the coefficient is continuous) ----
     faces = Dict{Symbol,NamedTuple}()
-    for (name, xyf) in ((:bot, (j, k) -> (xloc_all[k, :], fill((j-1)*h, qu1))),
-                        (:top, (j, k) -> (xloc_all[k, :], fill(j*h, qu1))),
-                        (:lft, (j, k) -> (fill((k-1)*h, qu1), yloc_all[j, :])),
-                        (:rgt, (j, k) -> (fill(k*h, qu1), yloc_all[j, :])))
-        c2 = zeros(N, N, qu1);  af = zeros(N, N, qu1)
-        cf = zeros(N, N, qu1);  bf = zeros(N, N, qu1)
-        for j in 1:N, k in 1:N
-            xf, yf = xyf(j, k)
-            cvals = cC.(xf, yf)
-            cf[j, k, :] = cvals
-            c2[j, k, :] = cvals.^2
-            af[j, k, :] = alphaC.(xf, yf)
-            bf[j, k, :] = betaC.(xf, yf)
+    for name in (:bot, :top, :lft, :rgt)
+        faces[name] = (c2 = zeros(N, N, qu1), af = zeros(N, N, qu1),
+                       cf = zeros(N, N, qu1), bf = zeros(N, N, qu1))
+    end
+    for (fun, key) in ((cC, :cf), (alphaC, :af), (betaC, :bf))
+        _side_values!(faces[:bot][key], faces[:top][key], faces[:lft][key], faces[:rgt][key],
+                      fun, xloc_all, yloc_all, N, h)
+    end
+    for name in (:bot, :top, :lft, :rgt)
+        faces[name].c2 .= faces[name].cf .^ 2
+    end
+
+    # ---- ∂_e u₀ on the sides of every element seen from inside it, e = +y on
+    # horizontal and +x on vertical faces (u₀ = Φ or the initial profile; zero
+    # in :source mode), for the interface terms of the ũ = u - u₀ change of
+    # variables (see `_rhs_data`) ----
+    g0 = (bot = zeros(N, N, qu1), top = zeros(N, N, qu1), lft = zeros(N, N, qu1), rgt = zeros(N, N, qu1))
+    if mode != :source
+        if initial_profile === nothing
+            u0_x = (x, y) -> -2π*kx * sin(2π*kx*x + px) * sin(2π*ky*y + py)
+            u0_y = (x, y) ->  2π*ky * cos(2π*kx*x + px) * cos(2π*ky*y + py)
+        else
+            u0_x = initial_profile.u0_x;  u0_y = initial_profile.u0_y
         end
-        faces[name] = (c2 = c2, af = af, cf = cf, bf = bf)
+        _side_values!(g0.bot, g0.top, nothing, nothing, u0_y, xloc_all, yloc_all, N, h)
+        _side_values!(nothing, nothing, g0.lft, g0.rgt, u0_x, xloc_all, yloc_all, N, h)
     end
 
     # ---- manufactured-solution data at the high-order points ----
@@ -563,6 +674,7 @@ function precompute(q::Int, N::Int;
         top_c2 = ft.c2,  top_af = ft.af,  top_cf = ft.cf,  top_bf = ft.bf,
         lft_c2 = fl.c2,  lft_af = fl.af,  lft_cf = fl.cf,  lft_bf = fl.bf,
         rgt_c2 = fr.c2,  rgt_af = fr.af,  rgt_cf = fr.cf,  rgt_bf = fr.bf,
+        bot_g0 = g0.bot,  top_g0 = g0.top,  lft_g0 = g0.lft,  rgt_g0 = g0.rgt,
         mms_SP = mms_SP,  mms_Cdiv = mms_Cdiv,  mms_Ddiv = mms_Ddiv,  mms_BF = mms_BF,
         bc_bot_sp = bc_bot_sp,  bc_bot_spy = bc_bot_spy,
         bc_top_sp = bc_top_sp,  bc_top_spy = bc_top_spy,
@@ -584,7 +696,15 @@ end
 # Data of the batched RHS (src/rhs.jl), derived from the element-by-element
 # arrays above:
 # - face coefficients by face: horizontal faces (point, face row 1..N+1, column),
-#   vertical faces (point, row, face column 1..N+1);
+#   vertical faces (point, row, face column 1..N+1); hc2, haf, … hold the
+#   values of the "+" element (above / to the right) and the boundary values,
+#   hc2m, hafm, vc2m, vafm those of the "-" element (below / to the left);
+#   on the physical boundary both are the boundary values;
+# - the jumps JC = [[c²∇u₀]] = c²₋ ∂_e u₀⁻ - c²₊ ∂_e u₀⁺ at the interior
+#   faces, zero on the boundary; they vanish where c is continuous and u₀ is
+#   smooth (always in :mms mode, which refuses jumps of c and α);
+# - one_sided: whether any interior face has different values of c² or α on
+#   its two sides or a nonzero JC (the face kernel of `_faces!`);
 # - boundary data by point: (point, column) on y = 0, 1 and (point, row) on x = 0, 1;
 # - Π(X) = P_h_v' (W ∘ X) P_h_v for X = Φ, βΦ², ∇·(c²∇Φ), ∇·(α∇Φ) per element
 #   (element-last), so that the manufactured source is a combination of them;
@@ -601,15 +721,40 @@ function _rhs_data(pre, N)
     vface(lft, rgt) = (A = zeros(nq, N, N + 1);
                        for k in 1:N, j in 1:N; A[:, j, k] = lft[j, k, :]; end;
                        for j in 1:N; A[:, j, N + 1] = rgt[j, N, :]; end; A)
+    # the same with the values of the "-" element at the interior faces
+    hfaceM(bot, top) = (A = zeros(nq, N + 1, N);
+                        for k in 1:N; A[:, 1, k] = bot[1, k, :]; end;
+                        for k in 1:N, j in 1:N; A[:, j + 1, k] = top[j, k, :]; end; A)
+    vfaceM(lft, rgt) = (A = zeros(nq, N, N + 1);
+                        for j in 1:N; A[:, j, 1] = lft[j, 1, :]; end;
+                        for k in 1:N, j in 1:N; A[:, j, k + 1] = rgt[j, k, :]; end; A)
     proj(X) = (Pi = zeros(nv, nv, N, N);
                for k in 1:N, j in 1:N
                    Pi[:, :, j, k] = pre.P_h_v' * (pre.W2d_h .* X[j, k, :, :]) * pre.P_h_v
                end; Pi)
     elast(X) = permutedims(X, (3, 4, 1, 2))
-    (hc2 = hface(pre.bot_c2, pre.top_c2), haf = hface(pre.bot_af, pre.top_af),
+    hc2 = hface(pre.bot_c2, pre.top_c2);  hc2m = hfaceM(pre.bot_c2, pre.top_c2)
+    haf = hface(pre.bot_af, pre.top_af);  hafm = hfaceM(pre.bot_af, pre.top_af)
+    vc2 = vface(pre.lft_c2, pre.rgt_c2);  vc2m = vfaceM(pre.lft_c2, pre.rgt_c2)
+    vaf = vface(pre.lft_af, pre.rgt_af);  vafm = vfaceM(pre.lft_af, pre.rgt_af)
+    hg0 = hface(pre.bot_g0, pre.top_g0);  hg0m = hfaceM(pre.bot_g0, pre.top_g0)
+    vg0 = vface(pre.lft_g0, pre.rgt_g0);  vg0m = vfaceM(pre.lft_g0, pre.rgt_g0)
+    jumps = hc2m != hc2 || hafm != haf || vc2m != vc2 || vafm != vaf
+    # the manufactured solution u = cos(ωt) Φ with smooth Φ does not satisfy
+    # the transmission conditions where c or α jumps
+    pre.mms_on && jumps &&
+        error("mode = :mms needs c and α continuous across the element faces; " *
+              "use :initial_value or :source for coefficients that jump")
+    hJC = hc2m .* hg0m .- hc2 .* hg0;  vJC = vc2m .* vg0m .- vc2 .* vg0
+    hJC[:, 1, :] .= 0.0;  hJC[:, N + 1, :] .= 0.0
+    vJC[:, :, 1] .= 0.0;  vJC[:, :, N + 1] .= 0.0
+    one_sided = jumps || any(!iszero, hJC) || any(!iszero, vJC)
+    (hc2 = hc2, haf = haf,
      hcf = hface(pre.bot_cf, pre.top_cf), hbf = hface(pre.bot_bf, pre.top_bf),
-     vc2 = vface(pre.lft_c2, pre.rgt_c2), vaf = vface(pre.lft_af, pre.rgt_af),
+     vc2 = vc2, vaf = vaf,
      vcf = vface(pre.lft_cf, pre.rgt_cf), vbf = vface(pre.lft_bf, pre.rgt_bf),
+     hc2m = hc2m, hafm = hafm, vc2m = vc2m, vafm = vafm,
+     hJC = hJC, vJC = vJC, one_sided = one_sided,
      bcB_sp = permutedims(pre.bc_bot_sp), bcB_spy = permutedims(pre.bc_bot_spy),
      bcT_sp = permutedims(pre.bc_top_sp), bcT_spy = permutedims(pre.bc_top_spy),
      bcL_sp = permutedims(pre.bc_lft_sp), bcL_spx = permutedims(pre.bc_lft_spx),
